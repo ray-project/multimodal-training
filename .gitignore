@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+outputs
+configs/*
+logs/*
+*.log
+prompts/*
+CLAUDE.md
+.claude

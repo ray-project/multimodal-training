@@ -1,0 +1,8 @@
+[style]
+based_on_style = pep8
+column_limit = 120
+split_before_logical_operator = true
+
+# Import formatting - compatible with isort
+split_before_first_argument = false
+dedent_closing_brackets = false

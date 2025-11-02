@@ -1,0 +1,57 @@
+repos:
+-   repo: meta
+    hooks:
+    -   id: check-hooks-apply
+    -   id: check-useless-excludes
+
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: check-case-conflict
+    -   id: check-yaml
+        exclude: ^scripts/train.yaml.j2$  # Jinja2 template, not pure YAML
+    -   id: destroyed-symlinks
+    -   id: end-of-file-fixer
+        exclude: ^(configs/|logs/)
+    -   id: fix-byte-order-marker
+    -   id: fix-encoding-pragma
+        args: [--remove]
+    -   id: mixed-line-ending
+        args: [--fix=lf]
+    -   id: trailing-whitespace
+        exclude: ^(configs/|logs/)
+
+# Run isort first to organize imports
+-   repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+    -   id: isort
+        exclude: ^(configs/|outputs/|logs/)
+
+# Then run black to format the code (designed to work with isort)
+-   repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+    -   id: black
+        args: ['--line-length=120']
+        exclude: ^(configs/|outputs/|logs/)
+
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+    -   id: codespell
+        args: [
+            '--skip=*.log,logs/*,outputs/*,configs/*,LICENSE',
+            '--ignore-regex=\\n',  # Do not count the 'n' in an escaped newline as part of a word
+            '--ignore-words-list=cann',
+            --check-filenames,
+            --check-hidden
+        ]
+
+# Finally run flake8 to catch any remaining issues
+-   repo: https://github.com/pycqa/flake8
+    rev: 7.1.1
+    hooks:
+    -   id: flake8
+        args: ['--config=.flake8']
+        exclude: ^(configs/|outputs/|logs/)
