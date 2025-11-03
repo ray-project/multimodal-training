@@ -327,6 +327,8 @@ If you want to resume training from a checkpoint, specify the `checkpoint_dir` w
 
 To use the pretrained weights for Qwen2.5-VL, please refer to [Loading Pretrained Weights](LOAD_PRETRAINED_WEIGHTS.md).
 
+To reproduce the experiments described above, please refer to [Experiments](experiments/EXPERIMENTS.md).
+
 ## References
 
 [1] Sam Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang, Reza Yazdani Aminabadi, Shuaiwen Leon Song, Samyam Rajbhandari, Yuxiong He. "DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models." *arXiv:2309.14509*, 2023. https://arxiv.org/abs/2309.14509

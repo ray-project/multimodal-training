@@ -1,0 +1,71 @@
+debug: false
+
+# Vision model configuration
+vision:
+  model_type: "{{ vision_model_type }}"  # Options: "qwen2_5_vl"
+  model_name: "{{ vision_model_name }}"  # Path to pretrained model
+  parallelism: "{{ vision_parallelism }}"  # Options: "none", "tensor", "sequence", "deepspeed"
+  dtype: "{{ vision_dtype }}"  # Options: "float16", "bfloat16", "float32"
+  attention_backend: "{{ vision_attention_backend }}"  # Options: "sdpa", "flash_attention_2", "eager"
+  activation_checkpointing: {{ vision_activation_checkpointing }}
+  autocast: {{ vision_autocast }}  # Enable torch autocast for mixed precision
+  zero_stage: {{ vision_zero_stage }}  # DeepSpeed ZeRO stage (1, 2, or 3)
+
+# Text model configuration
+text:
+  model_type: "{{ text_model_type }}"  # Options: "qwen2_5_vl"
+  model_name: "{{ text_model_name }}"  # Path to pretrained model
+  parallelism: "{{ text_parallelism }}"  # Options: "none", "tensor", "deepspeed"
+  dtype: "{{ text_dtype }}"  # Options: "float16", "bfloat16", "float32"
+  attention_backend: "{{ text_attention_backend }}"  # Options: "sdpa", "flash_attention_2", "eager"
+  activation_checkpointing: {{ text_activation_checkpointing }}
+  autocast: {{ text_autocast }}  # Enable torch autocast for mixed precision
+  zero_stage: {{ text_zero_stage }}  # DeepSpeed ZeRO stage (1, 2, or 3)
+
+# Training configuration
+training:
+  batch_size: {{ batch_size }}
+  learning_rate: {{ learning_rate }}
+  num_epochs: {{ num_epochs }}  # Number of training epochs
+  num_iterations: {{ num_iterations }}  # Number of iterations (batches) per epoch
+  warmup_steps: {{ warmup_steps }}
+  warmup_ratio: {{ warmup_ratio }}  # Proportion of training steps for LR warmup (takes precedence over warmup_steps if > 0)
+  lr_scheduler_type: "{{ lr_scheduler_type }}"  # Learning rate scheduler: "cosine", "linear", "constant", etc.
+  weight_decay: {{ weight_decay }}  # L2 regularization strength (weight decay)
+  gradient_accumulation_steps: {{ gradient_accumulation_steps }}
+  seed: {{ seed }}
+  parallel_size: {{ parallel_size }}  # Number of processes per model (vision and text)
+  collocate: {{ collocate }}  # Whether to collocate vision and text models on same GPUs
+  clip_grad_norm: {{ clip_grad_norm }}  # Enable gradient clipping
+  max_grad_norm: {{ max_grad_norm }}  # Maximum gradient norm (e.g., 1.0)
+  no_checkpoint: {{ no_checkpoint }}  # Disable checkpointing (default: false)
+  checkpoint_dir: "{{ checkpoint_dir }}"  # Directory to save/load checkpoints (only used if no_checkpoint=false)
+  log_interval: {{ log_interval }}  # Log training progress every N iterations
+
+# Data configuration
+data:
+  datasets:
+    - mscoco2017_train_captions
+  data_registry:
+    mscoco2017_train_captions:
+      annotation_path: "{{ mscoco_train_annotation_path }}"
+      data_path: "{{ mscoco_data_path }}"
+    mscoco2017_val_captions:
+      annotation_path: "{{ mscoco_val_annotation_path }}"
+      data_path: "{{ mscoco_data_path }}"
+    laion_pop_train:
+      annotation_path: "{{ laion_pop_train_annotation_path }}"
+      data_path: "{{ laion_pop_data_path }}"
+    laion_pop_val:
+      annotation_path: "{{ laion_pop_val_annotation_path }}"
+      data_path: "{{ laion_pop_data_path }}"
+  num_workers: 8
+  pin_memory: true
+  data_flatten: true
+  min_pixels: {{ min_pixels }}
+  max_pixels: {{ max_pixels }}
+  force_fixed_size: {{ force_fixed_size }}  # Force all images to fixed size (sqrt(max_pixels) x sqrt(max_pixels))
+
+# DeepSpeed configuration
+deepspeed:
+  reduce_bucket_size: {{ reduce_bucket_size }}  # Number of elements in gradient reduction bucket (500M or 100M for 64k_tokens)

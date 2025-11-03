@@ -23,19 +23,19 @@ sys.path.insert(0, str(project_root))
 # Model settings: (model_type, model_name, tp_size, warning)
 MODEL_SETTINGS = [
     ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
-    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", 8, ""),
+    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", 8, ""),
 ]
 
 # Token configurations: (label, max_pixels, min_pixels)
 # Labels indicate vision tokens (before spatial merging) passed to vision model
 # All values ensure num_windows % 8 == 0 for sequence parallelism compatibility
 TOKEN_CONFIGS = [
-    # ("1k_tokens", 200704, 200704),  # sqrt=448, 1024 vision tokens (closest to 1k)
+    ("1k_tokens", 200704, 200704),  # sqrt=448, 1024 vision tokens (closest to 1k)
     ("4k_tokens", 802816, 802816),  # sqrt=896, 4096 vision tokens (exact)
-    # ("8k_tokens", 1806336, 1806336),  # sqrt=1344, 9216 vision tokens (closest to 8k)
-    # ("16k_tokens", 3211264, 3211264),  # sqrt=1792, 16384 vision tokens (closest to 16k)
-    # ("32k_tokens", 5017600, 5017600),  # sqrt=2240, 25600 vision tokens (closest to 32k)
-    # ("64k_tokens", 12845056, 12845056),  # sqrt=3584, 65536 vision tokens (closest to 64k)
+    ("8k_tokens", 1806336, 1806336),  # sqrt=1344, 9216 vision tokens (closest to 8k)
+    ("16k_tokens", 3211264, 3211264),  # sqrt=1792, 16384 vision tokens (closest to 16k)
+    ("32k_tokens", 5017600, 5017600),  # sqrt=2240, 25600 vision tokens (closest to 32k)
+    ("64k_tokens", 12845056, 12845056),  # sqrt=3584, 65536 vision tokens (closest to 64k)
 ]
 
 # Parallelism strategies to test
@@ -181,7 +181,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
     data_config = get_data_config(mscoco_data_path, laion_data_path)
 
     # Load Jinja2 template
-    template_path = project_root / "scripts" / "train.yaml.j2"
+    template_path = project_root / "experiments" / "train.yaml.j2"
     with open(template_path) as f:
         template = Template(f.read())
 
@@ -339,4 +339,3 @@ if __name__ == "__main__":
         laion_data_path=args.laion_data_path,
     )
     print(f"\nGenerated {len(configs)} configs")
-    print(f"\nTo run all configs, use: ./run_all.sh {args.output_dir}")
