@@ -306,9 +306,8 @@ data:
   num_workers: 4
   pin_memory: true
   data_flatten: true
-  min_pixels: 50176
-  max_pixels: 784
-...
+  min_pixels: 802816
+  max_pixels: 802816
 ```
 
 
