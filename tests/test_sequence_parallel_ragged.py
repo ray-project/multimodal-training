@@ -9,6 +9,7 @@ These tests validate:
 - Zero-length rank detection
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -326,6 +327,38 @@ class TestEdgeCases:
 
         pack, _ = unpad_batch_to_pack(padded, mask)
         assert pack.shape[0] == 0  # Empty pack
+
+    def test_window_split_with_fewer_windows_than_ranks(self, caplog):
+        """Ensure window-aware splitting handles fewer windows than SP ranks."""
+        hidden_size = 8
+        total_len = 5
+        global_pack = torch.arange(total_len * hidden_size, dtype=torch.float32).view(total_len, hidden_size)
+        lengths = [total_len]
+        cu_window = torch.tensor([0, total_len], dtype=torch.int32)
+        sp_size = 4
+
+        caplog.set_level(logging.WARNING)
+        local_lengths = []
+        gathered = []
+        for rank in range(sp_size):
+            pack_rank, meta = split_pack_by_sp(
+                global_pack,
+                lengths_per_sample=lengths,
+                sp_rank=rank,
+                sp_size=sp_size,
+                cu_window_seqlens=cu_window,
+            )
+            local_lengths.append(meta.local_lengths[0])
+            if pack_rank.numel():
+                gathered.append(pack_rank)
+
+        assert local_lengths.count(0) == sp_size - 1
+        assert total_len in local_lengths
+        assert sorted(local_lengths) == [0, 0, 0, total_len]
+        assert caplog.records, "Expected a warning about insufficient windows"
+        assert "Sequence parallel requested" in caplog.text
+        if gathered:
+            torch.testing.assert_close(torch.cat(gathered, dim=0), global_pack)
 
     def test_device_consistency(self):
         """Test that all tensors stay on the same device."""

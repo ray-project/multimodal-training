@@ -497,6 +497,21 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
+        if seq_length == 0:
+            rank = dist.get_rank() if dist.is_initialized() else -1
+            sp_context = kwargs.get("_sp_context", {})
+            sp_group = sp_context.get("sp_group") if isinstance(sp_context, dict) else None
+            sp_size = sp_group.size() if sp_group is not None and hasattr(sp_group, "size") else "unknown"
+            meta = sp_context.get("meta") if isinstance(sp_context, dict) else None
+            tokens_per_sample = meta.global_lengths if meta is not None else None
+            smallest_sample = min(tokens_per_sample) if tokens_per_sample else 0
+            raise ValueError(
+                "Sequence parallel vision attention cannot operate with zero tokens on rank "
+                f"{rank} (sp_size={sp_size}). The current image resolution produces only "
+                f"{smallest_sample} token(s) per sample on the smallest shard, which is lower "
+                "than the number of sequence-parallel ranks. Increase `data.min_pixels`/`data.max_pixels` "
+                "or reduce `training.parallel_size` so that each rank receives at least one token."
+            )
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)

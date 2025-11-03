@@ -77,6 +77,17 @@ def get_dataset_configs(dataset_names: List[str], data_registry: Optional[Dict] 
 
 def update_processor_pixels(processor, min_pixels, max_pixels):
 
+    if min_pixels < 1 or max_pixels < 1:
+        raise ValueError(
+            f"Image pixel bounds must be positive integers. Got min_pixels={min_pixels}, max_pixels={max_pixels}."
+        )
+    if min_pixels > max_pixels:
+        raise ValueError(
+            "Invalid pixel range: `data.min_pixels` cannot exceed `data.max_pixels`. "
+            f"Received min_pixels={min_pixels}, max_pixels={max_pixels}. "
+            "Use matching or larger `max_pixels` when lowering the minimum image resolution."
+        )
+
     # --- Image Processor ---
     ip = processor.image_processor
     rank0_print("=== BEFORE IMAGE PROCESSOR PARAMETERS ===")

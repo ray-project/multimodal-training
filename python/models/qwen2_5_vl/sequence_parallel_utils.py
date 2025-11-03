@@ -121,8 +121,15 @@ def _compute_window_cut_positions(
 ) -> Tuple[List[int], List[int]]:
     """Compute token-aligned cut positions that respect window boundaries."""
 
+    if not window_lengths:
+        raise ValueError("Window-based splitting requested but no window lengths were provided.")
+
     prefix = [0]
     for length in window_lengths:
+        if length <= 0:
+            raise ValueError(
+                f"Encountered non-positive window length {length} while splitting sequence parallel chunks."
+            )
         prefix.append(prefix[-1] + length)
 
     if prefix[-1] != sample_len:
@@ -131,19 +138,29 @@ def _compute_window_cut_positions(
     cut_positions = [0]
     cut_indices = [0]
     last_idx = 0
+
     for step in range(1, sp_size):
         remaining = sp_size - step
         desired = (sample_len * step) // sp_size
         idx = bisect_left(prefix, desired, lo=last_idx)
         idx = max(idx, last_idx)
         max_idx = len(prefix) - remaining
-        idx = min(idx, max_idx)
+        if max_idx < last_idx:
+            max_idx = last_idx
+        if max_idx < 0:
+            max_idx = 0
+        max_idx = min(max_idx, len(prefix) - 1)
+        if idx > max_idx:
+            idx = max_idx
+        if idx >= len(prefix):
+            idx = len(prefix) - 1
         cut_positions.append(prefix[idx])
         cut_indices.append(idx)
         last_idx = idx
 
     cut_positions.append(prefix[-1])
     cut_indices.append(len(prefix) - 1)
+
     return cut_positions, cut_indices
 
 
@@ -204,6 +221,16 @@ def split_pack_by_sp(
                 sp_size,
                 window_lengths_per_sample[sample_idx],
             )
+            if sp_rank == 0 and any(cut_positions[i] == cut_positions[i + 1] for i in range(len(cut_positions) - 1)):
+                logger.warning(
+                    "Sequence parallel requested %d chunks but sample %d only provides %d window(s) (%d tokens). "
+                    "Some ranks will receive empty slices; consider increasing `data.min_pixels`/`data.max_pixels` "
+                    "or reducing the sequence parallel degree.",
+                    sp_size,
+                    sample_idx,
+                    len(window_lengths_per_sample[sample_idx]),
+                    sample_len,
+                )
         else:
             cut_positions = _compute_token_cut_positions(sample_len, sp_size)
             cut_indices = None
