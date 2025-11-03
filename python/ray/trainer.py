@@ -24,7 +24,7 @@ class Trainer(RayActor):
         set_seed(seed)
 
     def initialize_trainer(self):
-        logger.info(f"Initializing trainer {self.__class__.__name__}")
+        logger.debug(f"Initializing trainer {self.__class__.__name__}")
 
     def _build_dataloader(self, modality: str):
         """
@@ -264,7 +264,7 @@ class Trainer(RayActor):
         """
         if activation_checkpointing:
             model.gradient_checkpointing_enable()
-            logger.info(f"[r{self.rank}] Activation checkpointing enabled for {model_name}")
+            logger.debug(f"[r{self.rank}] Activation checkpointing enabled for {model_name}")
 
     def _reset_initialized_flag(self, model):
         """Reset HuggingFace _is_hf_initialized flag for weight initialization."""
@@ -566,7 +566,7 @@ class Trainer(RayActor):
             foreach=False,
         )
 
-        logger.info(
+        logger.debug(
             f"[r{self.rank}] Optimizer created: {len(decay_params)} params with decay, "
             f"{len(no_decay_params)} params without decay (weight_decay={weight_decay})"
         )
@@ -589,7 +589,7 @@ class Trainer(RayActor):
             optimizer = self.optimizer
         else:
             self.scheduler = None
-            logger.info(f"[r{self.rank}] No optimizer, skipping scheduler creation")
+            logger.debug(f"[r{self.rank}] No optimizer, skipping scheduler creation")
             return
 
         from transformers import get_scheduler
@@ -612,7 +612,7 @@ class Trainer(RayActor):
             num_training_steps=num_training_steps,
         )
 
-        logger.info(
+        logger.debug(
             f"[r{self.rank}] LR Scheduler created: type={lr_scheduler_type}, "
             f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
         )
@@ -717,11 +717,11 @@ class Trainer(RayActor):
 
         rank = getattr(self, "rank", 0)
         if sequence_parallel_world_size > 1:
-            logger.info(
+            logger.debug(
                 f"[r{rank}] DeepSpeed sequence parallel config: seq={sequence_parallel_world_size}, "
                 f"data={data_parallel_size}, total_world={total_world_size}"
             )
-        logger.info(f"[r{rank}] Initializing DeepSpeed with ZeRO stage {zero_stage}...")
+        logger.debug(f"[r{rank}] Initializing DeepSpeed with ZeRO stage {zero_stage}...")
 
         # Initialize with DeepSpeed
         model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -731,7 +731,7 @@ class Trainer(RayActor):
             mpu=mpu,
         )
 
-        logger.info(f"[r{rank}] DeepSpeed initialization complete")
+        logger.debug(f"[r{rank}] DeepSpeed initialization complete")
 
         # Mark that we're using DeepSpeed
         self.use_deepspeed = True
