@@ -1,0 +1,71 @@
+debug: false
+
+# Vision model configuration
+vision:
+  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
+  parallelism: "sequence"  # Options: "none", "tensor", "sequence", "deepspeed"
+  dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
+  attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
+  activation_checkpointing: true
+  autocast: true  # Enable torch autocast for mixed precision
+  zero_stage: 1  # DeepSpeed ZeRO stage (1, 2, or 3)
+
+# Text model configuration
+text:
+  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
+  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed"
+  dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
+  attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
+  activation_checkpointing: true
+  autocast: true  # Enable torch autocast for mixed precision
+  zero_stage: 3  # DeepSpeed ZeRO stage (1, 2, or 3)
+
+# Training configuration
+training:
+  batch_size: 4
+  learning_rate: 5e-05
+  num_epochs: 1  # Number of training epochs
+  num_iterations: 20  # Number of iterations (batches) per epoch
+  warmup_steps: 10
+  warmup_ratio: 0.03  # Proportion of training steps for LR warmup (takes precedence over warmup_steps if > 0)
+  lr_scheduler_type: "cosine"  # Learning rate scheduler: "cosine", "linear", "constant", etc.
+  weight_decay: 0.01  # L2 regularization strength (weight decay)
+  gradient_accumulation_steps: 1
+  seed: 42
+  parallel_size: 8  # Number of processes per model (vision and text)
+  collocate: true  # Whether to collocate vision and text models on same GPUs
+  clip_grad_norm: false  # Enable gradient clipping
+  max_grad_norm: 1.0  # Maximum gradient norm (e.g., 1.0)
+  no_checkpoint: true  # Disable checkpointing (default: false)
+  checkpoint_dir: "/tmp/checkpoints"  # Directory to save/load checkpoints (only used if no_checkpoint=false)
+  log_interval: 1  # Log training progress every N iterations
+
+# Data configuration
+data:
+  datasets:
+    - laion_pop_train
+  data_registry:
+    mscoco2017_train_captions:
+      annotation_path: "/path/to/mscoco2017/annotations/coco2017_train.json"
+      data_path: "/path/to/mscoco2017"
+    mscoco2017_val_captions:
+      annotation_path: "/path/to/mscoco2017/annotations/coco2017_val.json"
+      data_path: "/path/to/mscoco2017"
+    laion_pop_train:
+      annotation_path: "/path/to/laion_pop/laion_pop_train.jsonl"
+      data_path: "/path/to/laion_pop/images"
+    laion_pop_val:
+      annotation_path: "/path/to/laion_pop/laion_pop_val.jsonl"
+      data_path: "/path/to/laion_pop/images"
+  num_workers: 4
+  pin_memory: true
+  data_flatten: true
+  min_pixels: 802816
+  max_pixels: 802816
+  force_fixed_size: false  # Force all images to fixed size (sqrt(max_pixels) x sqrt(max_pixels)) for benchmarking
+
+# DeepSpeed configuration
+deepspeed:
+  reduce_bucket_size: 500000000  # Number of elements in gradient reduction bucket (500M or 100M for 64k_tokens)
