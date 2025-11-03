@@ -40,7 +40,7 @@ class BaseVisionTrainer(Trainer):
         self.projector = None
         self._pending_outputs: deque[torch.Tensor] = deque()
         self.sp_group = None  # Sequence parallel group (initialized when parallelism == "sequence")
-        logger.info(f"[r{self.rank}] {self.__class__.__name__} initialized")
+        logger.debug(f"[r{self.rank}] {self.__class__.__name__} initialized")
 
     @abstractmethod
     def _create_model_instance(self, model_config):
@@ -110,7 +110,7 @@ class BaseVisionTrainer(Trainer):
             load_pretrained_path: Optional path to pretrained checkpoint directory
         """
         # Load model config
-        logger.info(f"[r{self.rank}] Loading vision model config...")
+        logger.debug(f"[r{self.rank}] Loading vision model config...")
         model_config = self._load_model_config(model_name)
 
         # Configure attention backend
@@ -142,13 +142,13 @@ class BaseVisionTrainer(Trainer):
             if world_size % sequence_parallel_size != 0:
                 raise ValueError(f"sequence_parallel_size {sequence_parallel_size} must divide world size {world_size}")
             data_parallel_size = world_size // sequence_parallel_size
-            logger.info(
+            logger.debug(
                 f"[r{self.rank}] Initializing DeepSpeed sequence parallel:"
                 f" seq={sequence_parallel_size} data={data_parallel_size} world={world_size}"
             )
             mpu.initialize_sequence_parallel(sequence_parallel_size=sequence_parallel_size)
             self.sp_group = mpu.get_sequence_parallel_group()
-            logger.info(f"[r{self.rank}] Sequence parallel group initialized: {self.sp_group}")
+            logger.debug(f"[r{self.rank}] Sequence parallel group initialized: {self.sp_group}")
 
             # Build with DeepSpeed engine to enable gradient reduction and optional ZeRO
             # Pass sp_group so it can be set up after model creation
@@ -173,7 +173,7 @@ class BaseVisionTrainer(Trainer):
         # Build model
         torch.set_default_device(device)
 
-        logger.info(f"[r{self.rank}] Creating vision model...")
+        logger.debug(f"[r{self.rank}] Creating vision model...")
         model, projector = self._create_model_instance(model_config)
 
         torch.set_default_device("cpu")
@@ -203,7 +203,7 @@ class BaseVisionTrainer(Trainer):
             tp_world_size = dist.get_world_size()
             tp_mesh = init_device_mesh("cuda", (tp_world_size,))
 
-            logger.info(f"[r{self.rank}] Applying tensor parallelism...")
+            logger.debug(f"[r{self.rank}] Applying tensor parallelism...")
 
             # Parallelize transformer blocks
             layers = self._get_transformer_layers(model)
@@ -244,7 +244,7 @@ class BaseVisionTrainer(Trainer):
         """
         # Build model on target device
         torch.set_default_device(device)
-        logger.info(f"[r{self.rank}] Creating vision model for DeepSpeed...")
+        logger.debug(f"[r{self.rank}] Creating vision model for DeepSpeed...")
         model, projector = self._create_model_instance(model_config)
         torch.set_default_device("cpu")
 
@@ -268,7 +268,7 @@ class BaseVisionTrainer(Trainer):
 
         # Set up sequence parallelism group if provided
         if sp_group is not None:
-            logger.info(f"[r{self.rank}] Setting sp_group for sequence parallelism in DeepSpeed model")
+            logger.debug(f"[r{self.rank}] Setting sp_group for sequence parallelism in DeepSpeed model")
             self._setup_sequence_parallel(model, sp_group)
 
         # Collect parameters from model and projector
@@ -306,7 +306,7 @@ class BaseVisionTrainer(Trainer):
             logger.warning(f"[r{self.rank}] Pretrained checkpoint not found: {checkpoint_path}")
             return False
 
-        logger.info(f"[r{self.rank}] Loading pretrained vision weights from {checkpoint_path}")
+        logger.debug(f"[r{self.rank}] Loading pretrained vision weights from {checkpoint_path}")
 
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -385,7 +385,7 @@ class BaseVisionTrainer(Trainer):
         if self.projector is not None:
             self.projector.train()
 
-        logger.info(f"[r{self.rank}] Vision model built successfully")
+        logger.debug(f"[r{self.rank}] Vision model built successfully")
 
         # Build optimizer with both model and projector parameters
         # Skip if using DeepSpeed (optimizer is created by DeepSpeed)
@@ -395,14 +395,14 @@ class BaseVisionTrainer(Trainer):
                 params.extend(list(self.projector.parameters()))
             self._build_optimizer(params)
         else:
-            logger.info(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
+            logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
         self._build_scheduler(self.config["num_iterations"])
 
     def initialize_trainer(self):
         """Initialize the trainer with real dataset via build_dataloader."""
-        logger.info(f"[r{self.rank}] {self.__class__.__name__} initialize_trainer called")
+        logger.debug(f"[r{self.rank}] {self.__class__.__name__} initialize_trainer called")
 
         # Build dataloader using common helper method
         self.dataloader = self._build_dataloader(modality="image")
@@ -410,7 +410,7 @@ class BaseVisionTrainer(Trainer):
 
         batch_size = self.config["batch_size"]
         dataset_len = len(self.dataloader.dataset)
-        logger.info(
+        logger.debug(
             f"[r{self.rank}] {self.__class__.__name__} initialized with {dataset_len} samples, batch_size={batch_size}"
         )
         super().initialize_trainer()
@@ -419,7 +419,9 @@ class BaseVisionTrainer(Trainer):
         """Set receiver GPU IDs and whether to use CUDA IPC."""
         self.receiver_gpu_ids = receiver_gpu_ids
         self.use_ipc = use_ipc
-        logger.info(f"[r{self.rank}] {self.__class__.__name__}: receiver_gpu_ids={receiver_gpu_ids}, use_ipc={use_ipc}")
+        logger.debug(
+            f"[r{self.rank}] {self.__class__.__name__}: receiver_gpu_ids={receiver_gpu_ids}, use_ipc={use_ipc}"
+        )
 
     def forward_step(self, iteration: int = -1):
         """Run one forward pass on the vision model.
@@ -569,7 +571,7 @@ class BaseVisionTrainer(Trainer):
             checkpoint_data["projector"] = self.projector.state_dict()
 
         torch.save(checkpoint_data, checkpoint_path)
-        logger.info(f"[r{self.rank}] Saved vision checkpoint to {checkpoint_path}")
+        logger.debug(f"[r{self.rank}] Saved vision checkpoint to {checkpoint_path}")
 
         return checkpoint_path
 
@@ -610,7 +612,7 @@ class BaseVisionTrainer(Trainer):
             if "projector" in checkpoint_data and self.projector is not None and self.rank == 0:
                 self.projector.load_state_dict(checkpoint_data["projector"])
 
-            logger.info(f"[r{self.rank}] Loaded vision checkpoint from {checkpoint_path}")
+            logger.debug(f"[r{self.rank}] Loaded vision checkpoint from {checkpoint_path}")
             return True
 
         except Exception as e:

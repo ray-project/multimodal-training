@@ -26,7 +26,7 @@ class BaseTextTrainer(Trainer):
         self.receiver_gpu_ids = None  # GPU IDs of vision trainers (for sending gradients back)
         self.use_ipc = False  # Whether to use CUDA IPC for this actor
         self._vision_grad_owner_rank = rank  # Which rank should receive gradients from this actor
-        logger.info(f"[r{self.rank}] {self.__class__.__name__} initialized")
+        logger.debug(f"[r{self.rank}] {self.__class__.__name__} initialized")
 
     @abstractmethod
     def _create_model_and_lm_head(self, model_config):
@@ -87,7 +87,7 @@ class BaseTextTrainer(Trainer):
             tuple: (model, lm_head, tp_group)
         """
         # Load model config
-        logger.info(f"[r{self.rank}] Loading text model config...")
+        logger.debug(f"[r{self.rank}] Loading text model config...")
         model_config = self._load_model_config(model_name)
 
         # Configure attention backend
@@ -111,7 +111,7 @@ class BaseTextTrainer(Trainer):
         # Set default device
         torch.set_default_device(device)
 
-        logger.info(f"[r{self.rank}] Creating text model...")
+        logger.debug(f"[r{self.rank}] Creating text model...")
         model, lm_head = self._create_model_and_lm_head(model_config)
 
         # Reset default device
@@ -186,7 +186,7 @@ class BaseTextTrainer(Trainer):
 
         # Build model on target device
         torch.set_default_device(device)
-        logger.info(f"[r{self.rank}] Creating text model for DeepSpeed...")
+        logger.debug(f"[r{self.rank}] Creating text model for DeepSpeed...")
         model, lm_head = self._create_model_and_lm_head(model_config, nullcontext())
         torch.set_default_device("cpu")
 
@@ -243,10 +243,10 @@ class BaseTextTrainer(Trainer):
         tp_world_size = dist.get_world_size()
         tp_mesh = init_device_mesh("cuda", (tp_world_size,))
 
-        logger.info(f"[r{self.rank}] Applying tensor parallelism to text model...")
+        logger.debug(f"[r{self.rank}] Applying tensor parallelism to text model...")
 
         # Replace embedding with VocabParallelEmbedding for correct vocabulary parallelism
-        logger.info(f"[r{self.rank}] Replacing embedding layer with VocabParallelEmbedding...")
+        logger.debug(f"[r{self.rank}] Replacing embedding layer with VocabParallelEmbedding...")
         original_embedding = self._get_embedding_module(model)
         if original_embedding is None:
             raise ValueError("Unable to locate embedding module for tensor parallelism.")
@@ -271,7 +271,7 @@ class BaseTextTrainer(Trainer):
         # For Qwen models, this is model.embed_tokens
         # For InternVL, we need to search through the model hierarchy
         self._replace_embedding_module(model, vocab_parallel_embedding)
-        logger.info(
+        logger.debug(
             f"[r{self.rank}] Embedding replaced: vocab_range=[{start_idx}, {end_idx}), "
             f"partition_size={end_idx - start_idx}"
         )
@@ -303,7 +303,7 @@ class BaseTextTrainer(Trainer):
             logger.warning(f"[r{self.rank}] Pretrained checkpoint not found: {checkpoint_path}")
             return False
 
-        logger.info(f"[r{self.rank}] Loading pretrained text weights from {checkpoint_path}")
+        logger.debug(f"[r{self.rank}] Loading pretrained text weights from {checkpoint_path}")
 
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -365,7 +365,7 @@ class BaseTextTrainer(Trainer):
 
         # Make sure to free up the memory used before TP partitioning
         torch.cuda.empty_cache()
-        logger.info(f"[r{self.rank}] Text model built successfully")
+        logger.debug(f"[r{self.rank}] Text model built successfully")
         self.model = model
 
         # Store model config and lm_head for later use
@@ -383,7 +383,7 @@ class BaseTextTrainer(Trainer):
         if not self.use_deepspeed:
             self._build_optimizer(self._collect_optimizer_parameters())
         else:
-            logger.info(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
+            logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
         self._build_scheduler(self.config["num_iterations"])
@@ -421,7 +421,7 @@ class BaseTextTrainer(Trainer):
 
     def initialize_trainer(self):
         """Initialize the trainer with real dataset via build_dataloader (text)."""
-        logger.info(f"[r{self.rank}] {self.__class__.__name__} initialize_trainer called")
+        logger.debug(f"[r{self.rank}] {self.__class__.__name__} initialize_trainer called")
 
         # Build dataloader using common helper method
         # Use modality="all" to get full sequence with <image> placeholder tokens
@@ -430,7 +430,7 @@ class BaseTextTrainer(Trainer):
 
         batch_size = self.config["batch_size"]
         dataset_len = len(self.dataloader.dataset)
-        logger.info(
+        logger.debug(
             f"[r{self.rank}] {self.__class__.__name__} initialized with {dataset_len} samples, batch_size={batch_size}"
         )
 
@@ -443,7 +443,9 @@ class BaseTextTrainer(Trainer):
         """
         self.receiver_gpu_ids = receiver_gpu_ids
         self.use_ipc = use_ipc
-        logger.info(f"[r{self.rank}] {self.__class__.__name__}: receiver_gpu_ids={receiver_gpu_ids}, use_ipc={use_ipc}")
+        logger.debug(
+            f"[r{self.rank}] {self.__class__.__name__}: receiver_gpu_ids={receiver_gpu_ids}, use_ipc={use_ipc}"
+        )
 
     def forward_step(self, vision_embeddings_ref, iteration: int = -1):
         """
@@ -797,7 +799,7 @@ class BaseTextTrainer(Trainer):
         # The weight tying will be automatically restored when we load the model
 
         torch.save(checkpoint_data, checkpoint_path)
-        logger.info(f"[r{self.rank}] Saved text checkpoint to {checkpoint_path}")
+        logger.debug(f"[r{self.rank}] Saved text checkpoint to {checkpoint_path}")
 
         return checkpoint_path
 
@@ -837,7 +839,7 @@ class BaseTextTrainer(Trainer):
             # Note: Weight tying will automatically reflect in lm_head
             # No need to load lm_head separately
 
-            logger.info(f"[r{self.rank}] Loaded text checkpoint from {checkpoint_path}")
+            logger.debug(f"[r{self.rank}] Loaded text checkpoint from {checkpoint_path}")
             return True
 
         except Exception as e:
