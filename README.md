@@ -317,8 +317,8 @@ data:
 You can run training specifying the configuration file.
 
 ```bash
-python -m python.entry_points.train_ray \
-    --config-path=../../configs \
+python -m python.train_ray \
+    --config-path=../configs \
     --config-name=sample
 ```
 
