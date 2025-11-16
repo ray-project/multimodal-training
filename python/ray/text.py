@@ -386,7 +386,11 @@ class BaseTextTrainer(Trainer):
             logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
-        self._build_scheduler(self.config["num_iterations"])
+        # Calculate actual optimizer steps accounting for gradient accumulation
+        num_iterations = self.config["num_iterations"]
+        gradient_accumulation_steps = self.config["gradient_accumulation_steps"]
+        num_optimizer_steps = num_iterations // gradient_accumulation_steps
+        self._build_scheduler(num_optimizer_steps)
 
         # Initialize loss function (CrossEntropyLoss with ignore_index=-100 for padding)
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
@@ -693,6 +697,13 @@ class BaseTextTrainer(Trainer):
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        # Scale loss for gradient accumulation (non-DeepSpeed only)
+        # DeepSpeed handles gradient accumulation internally via config
+        if not self.use_deepspeed:
+            gradient_accumulation_steps = self.config.get("gradient_accumulation_steps", 1)
+            if gradient_accumulation_steps > 1:
+                loss = loss / gradient_accumulation_steps
 
         # Save loss for backward pass
         self.loss = loss

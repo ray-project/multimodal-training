@@ -398,7 +398,11 @@ class BaseVisionTrainer(Trainer):
             logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
-        self._build_scheduler(self.config["num_iterations"])
+        # Calculate actual optimizer steps accounting for gradient accumulation
+        num_iterations = self.config["num_iterations"]
+        gradient_accumulation_steps = self.config.get("gradient_accumulation_steps", 1)
+        num_optimizer_steps = num_iterations // gradient_accumulation_steps
+        self._build_scheduler(num_optimizer_steps)
 
     def initialize_trainer(self):
         """Initialize the trainer with real dataset via build_dataloader."""

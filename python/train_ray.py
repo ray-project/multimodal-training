@@ -238,6 +238,7 @@ def main(cfg: DictConfig):
     warmup_steps = cfg.training.warmup_steps
     no_checkpoint = cfg.training.no_checkpoint
     log_interval = cfg.training.log_interval
+    gradient_accumulation_steps = cfg.training.gradient_accumulation_steps
 
     # Get checkpoint directory and convert to absolute path
     checkpoint_dir = None
@@ -267,7 +268,8 @@ def main(cfg: DictConfig):
 
     # Training loop
     logger.info(
-        f"Starting training: {num_epochs} epochs, {num_iterations} iterations/epoch, " f"warmup={warmup_steps} steps"
+        f"Starting training: {num_epochs} epochs, {num_iterations} iterations/epoch, "
+        f"warmup={warmup_steps} steps, gradient_accumulation_steps={gradient_accumulation_steps}"
     )
 
     iteration_times = []
@@ -282,12 +284,16 @@ def main(cfg: DictConfig):
         epoch_loss = 0.0
 
         for iteration in range(num_iterations):
+            # Check if this is a gradient accumulation boundary
+            is_accumulation_boundary = (iteration + 1) % gradient_accumulation_steps == 0
+
             measure_metrics = global_step >= warmup_steps
             iteration_start = time.perf_counter() if measure_metrics else None
 
-            # Zero gradients at the start of each iteration
-            vision_trainer_group.execute_all("zero_grad")
-            text_trainer_group.execute_all("zero_grad")
+            # Zero gradients at the start of each accumulation cycle
+            if iteration % gradient_accumulation_steps == 0:
+                vision_trainer_group.execute_all("zero_grad")
+                text_trainer_group.execute_all("zero_grad")
 
             # Vision forward pass
             vision_refs = vision_trainer_group.execute_all_async("forward_step", global_step)
@@ -307,18 +313,23 @@ def main(cfg: DictConfig):
             vision_backward_refs = vision_trainer_group.execute_all_async("backward_step", text_backward_refs)
             ray.get(vision_backward_refs)
 
-            # Gradient clipping (if enabled)
-            global_grad_norm = None
-            if cfg.training.get("clip_grad_norm", False):
-                vision_norm_refs = vision_trainer_group.execute_all_async("compute_grad_norm_contribution")
-                text_norm_refs = text_trainer_group.execute_all_async("compute_grad_norm_contribution")
-                vision_norms = ray.get(vision_norm_refs)
-                text_norms = ray.get(text_norm_refs)
-                global_grad_norm = aggregate_grad_norms(vision_norms, text_norms)
+            # Gradient clipping and optimizer step only at accumulation boundaries
+            if is_accumulation_boundary:
+                # Gradient clipping (if enabled)
+                global_grad_norm = None
+                if cfg.training.get("clip_grad_norm", False):
+                    vision_norm_refs = vision_trainer_group.execute_all_async("compute_grad_norm_contribution")
+                    text_norm_refs = text_trainer_group.execute_all_async("compute_grad_norm_contribution")
+                    vision_norms = ray.get(vision_norm_refs)
+                    text_norms = ray.get(text_norm_refs)
+                    global_grad_norm = aggregate_grad_norms(vision_norms, text_norms)
 
-            # Optimizer steps
-            text_trainer_group.execute_all("optimizer_step", global_grad_norm)
-            vision_trainer_group.execute_all("optimizer_step", global_grad_norm)
+                # Optimizer steps
+                text_trainer_group.execute_all("optimizer_step", global_grad_norm)
+                vision_trainer_group.execute_all("optimizer_step", global_grad_norm)
+
+                # Increment global step only at accumulation boundaries
+                global_step += 1
 
             if measure_metrics and iteration_start is not None:
                 iteration_elapsed = time.perf_counter() - iteration_start
@@ -329,10 +340,8 @@ def main(cfg: DictConfig):
                 status = "warmup" if global_step < warmup_steps else "training"
                 logger.info(
                     f"Epoch {epoch + 1}/{num_epochs}, Iter {iteration + 1}/{num_iterations} "
-                    f"({status}) - Loss: {avg_loss:.4f}"
+                    f"({status}) - Loss: {avg_loss:.4f}, Global step: {global_step}"
                 )
-
-            global_step += 1
 
         # End of epoch
         epoch_elapsed = time.perf_counter() - epoch_start
