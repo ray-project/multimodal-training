@@ -106,6 +106,7 @@ class BaseTextTrainer(Trainer):
 
         if parallelism == "autotp":
             import os
+
             import torch.distributed as dist
 
             from .utils import init_distributed_comm
@@ -260,7 +261,6 @@ class BaseTextTrainer(Trainer):
             (model_engine, lm_head, tp_group) tuple where model_engine is DeepSpeed engine
         """
         import torch.distributed as dist
-
         from deepspeed.module_inject.layers import set_autotp_mode
         from deepspeed.utils import groups
 
@@ -965,6 +965,7 @@ class BaseTextTrainer(Trainer):
             logger.error(f"[r{self.rank}] Failed to load checkpoint from {checkpoint_path}: {e}")
             return False
 
+
 class QwenTextMixin:
     """Qwen2.5-VL text model helpers shared by Ray and standalone trainers."""
 
@@ -1008,4 +1009,5 @@ class QwenTextMixin:
 @ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
 class QwenTextTrainer(QwenTextMixin, BaseTextTrainer):
     """Qwen2.5-VL text trainer."""
+
     pass
