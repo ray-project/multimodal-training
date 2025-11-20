@@ -706,13 +706,16 @@ class Trainer(RayActor):
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "zero_optimization": {
                 "stage": zero_stage,
-                "allow_user_backward": True,
                 "reduce_bucket_size": reduce_bucket_size,
             },
             "fp16": {
                 "enabled": torch_dtype == torch.float16,
             },
-            "bf16": {"enabled": torch_dtype == torch.bfloat16, "bf16_master_weights_and_grads": True},
+            "bf16": {
+                "enabled": torch_dtype == torch.bfloat16,
+                "bf16_master_weights_and_grads": True,
+                "bf16_optimizer_states": True,
+                },
             "torch_autocast": {
                 "enabled": use_torch_autocast,
                 "dtype": str(torch_dtype),
