@@ -714,9 +714,10 @@ class BaseTextTrainer(Trainer):
         # Now vision_embeddings is [batch_size, num_vision_tokens, hidden_size] or [1, num_tokens, hidden]
 
         # Enable gradient computation for vision embeddings (needed for backward pass)
-        # If this came via CUDA IPC, we need to clone it to avoid keeping the shared memory alive
-        # The IPC tensor is just a view into the sender's memory, so we make our own copy
-        vision_embeddings = vision_embeddings.clone().requires_grad_(True)
+        # Detach first so the new tensor is a leaf and gets .grad populated.
+        # If this came via CUDA IPC, this also avoids keeping the shared memory alive.
+        vision_embeddings = vision_embeddings.detach().clone().requires_grad_(True)
+        vision_embeddings.retain_grad()
 
         # Save for backward pass
         self.vision_embeddings = vision_embeddings
