@@ -15,12 +15,14 @@ vision:
 text:
   model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
   model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
-  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed"
+  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed", "autotp"
   dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
   attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
   activation_checkpointing: true
   autocast: true  # Enable torch autocast for mixed precision
   zero_stage: 3  # DeepSpeed ZeRO stage (1, 2, or 3)
+  autotp_size: null  # Optional tensor parallel size when using AutoTP (defaults to world size)
+  tp_overlap_comm: false  # Enable TP communication overlap for AutoTP if supported
 
 # Training configuration
 training:
@@ -48,17 +50,17 @@ data:
     - laion_pop_train
   data_registry:
     mscoco2017_train_captions:
-      annotation_path: "/path/to/mscoco2017/annotations/coco2017_train.json"
-      data_path: "/path/to/mscoco2017"
+      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_train_qwen.json"
+      data_path: "/mnt/local_storage/mscoco2017"
     mscoco2017_val_captions:
-      annotation_path: "/path/to/mscoco2017/annotations/coco2017_val.json"
-      data_path: "/path/to/mscoco2017"
+      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_val_qwen.json"
+      data_path: "/mnt/local_storage/mscoco2017"
     laion_pop_train:
-      annotation_path: "/path/to/laion_pop/laion_pop_train.jsonl"
-      data_path: "/path/to/laion_pop/images"
+      annotation_path: "/mnt/local_storage/laion/laion_pop_train.jsonl"
+      data_path: "/mnt/local_storage/laion/images"
     laion_pop_val:
-      annotation_path: "/path/to/laion_pop/laion_pop_val.jsonl"
-      data_path: "/path/to/laion_pop/images"
+      annotation_path: "/mnt/local_storage/laion/laion_pop_val.jsonl"
+      data_path: "/mnt/local_storage/laion/images"
   num_workers: 4
   pin_memory: true
   data_flatten: true

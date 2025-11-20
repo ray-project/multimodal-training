@@ -104,6 +104,18 @@ class BaseTextTrainer(Trainer):
                 init_distributed_comm(backend="nccl", use_deepspeed=True)
             return self._build_model_with_deepspeed(config, model_config, device, torch_dtype, load_pretrained_path)
 
+        if parallelism == "autotp":
+            import os
+            import torch.distributed as dist
+
+            from .utils import init_distributed_comm
+
+            if not dist.is_initialized():
+                world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+                if world_size_env > 1:
+                    init_distributed_comm(backend="nccl", use_deepspeed=True)
+            return self._build_model_with_autotp(config, model_config, device, torch_dtype, load_pretrained_path)
+
         # Validate tensor parallelism compatibility
         if parallelism == "tensor":
             self._validate_tensor_parallelism(model_config)
@@ -152,21 +164,24 @@ class BaseTextTrainer(Trainer):
 
         return model, lm_head, tp_group
 
-    def _validate_tensor_parallelism(self, model_config):
+    def _validate_tensor_parallelism(self, model_config, tp_world_size=None):
         """Validate that tensor parallelism is compatible with model config."""
-        init_distributed_comm(backend="nccl")
-        import torch.distributed as dist
+        if tp_world_size is None:
+            init_distributed_comm(backend="nccl")
+            import torch.distributed as dist
 
-        if dist.is_initialized():
+            if not dist.is_initialized():
+                return
             tp_world_size = dist.get_world_size()
-            # Get num_key_value_heads from text_config
-            text_config = getattr(model_config, "text_config", model_config)
-            num_kv_heads = text_config.num_key_value_heads
-            if num_kv_heads % tp_world_size != 0:
-                raise ValueError(
-                    f"Tensor parallel world size must divide num_key_value_heads. "
-                    f"Got world size {tp_world_size} and num_key_value_heads {num_kv_heads}."
-                )
+
+        # Get num_key_value_heads from text_config
+        text_config = getattr(model_config, "text_config", model_config)
+        num_kv_heads = text_config.num_key_value_heads
+        if num_kv_heads % tp_world_size != 0:
+            raise ValueError(
+                f"Tensor parallel world size must divide num_key_value_heads. "
+                f"Got world size {tp_world_size} and num_key_value_heads {num_kv_heads}."
+            )
 
     def _build_model_with_deepspeed(self, config, model_config, device, torch_dtype, load_pretrained_path=None):
         """
@@ -182,12 +197,10 @@ class BaseTextTrainer(Trainer):
         Returns:
             (model_engine, lm_head, tp_group) tuple where model_engine is DeepSpeed engine
         """
-        from contextlib import nullcontext
-
         # Build model on target device
         torch.set_default_device(device)
         logger.debug(f"[r{self.rank}] Creating text model for DeepSpeed...")
-        model, lm_head = self._create_model_and_lm_head(model_config, nullcontext())
+        model, lm_head = self._create_model_and_lm_head(model_config)
         torch.set_default_device("cpu")
 
         model.to(torch_dtype)
@@ -231,6 +244,108 @@ class BaseTextTrainer(Trainer):
 
         # Return the engine in place of model (lm_head stays separate, tp_group is None)
         return model_engine, lm_head, None
+
+    def _build_model_with_autotp(self, config, model_config, device, torch_dtype, load_pretrained_path=None):
+        """
+        Build model with DeepSpeed AutoTP tensor parallelism.
+
+        Args:
+            config: Training config dict
+            model_config: Model configuration
+            device: Target device
+            torch_dtype: Target dtype
+            load_pretrained_path: Optional path to pretrained checkpoint directory
+
+        Returns:
+            (model_engine, lm_head, tp_group) tuple where model_engine is DeepSpeed engine
+        """
+        import torch.distributed as dist
+
+        from deepspeed.module_inject.layers import set_autotp_mode
+        from deepspeed.utils import groups
+
+        # Enable AutoTP instrumentation before model creation
+        set_autotp_mode(training=True)
+
+        # Build model on target device
+        torch.set_default_device(device)
+        logger.debug(f"[r{self.rank}] Creating text model for AutoTP...")
+        model, lm_head = self._create_model_and_lm_head(model_config)
+        torch.set_default_device("cpu")
+
+        model.to(torch_dtype)
+        lm_head.to(torch_dtype)
+
+        # Load pretrained weights BEFORE DeepSpeed wrapping
+        if load_pretrained_path:
+            import os
+
+            text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
+            # Temporarily assign model for loading
+            self.model = model
+            self.load_pretrained_weights(text_checkpoint_path)
+            model = self.model
+
+        # Apply activation checkpointing
+        activation_checkpointing = config["activation_checkpointing"]
+        self._apply_activation_checkpointing(model, activation_checkpointing, "text model")
+
+        # Tie weights between lm_head and embeddings
+        embed_module = self._get_embedding_module(model)
+        if embed_module is None:
+            raise ValueError("Unable to locate embedding module for tying the LM head.")
+        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+
+        # Attach lm_head to model so DeepSpeed can manage both
+        model.lm_head = lm_head
+
+        # Collect parameters from model and lm_head
+        params = self._collect_parameters_from_modules(model, lm_head)
+
+        # Determine AutoTP size (defaults to world size if not provided)
+        autotp_size = config.get("autotp_size") or config.get("tensor_parallel_size")
+        if autotp_size is None:
+            autotp_size = dist.get_world_size() if dist.is_initialized() else 1
+        autotp_size = int(autotp_size)
+        if autotp_size <= 0:
+            raise ValueError(f"autotp_size must be > 0, got {autotp_size}")
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            if autotp_size > world_size or world_size % autotp_size != 0:
+                raise ValueError(
+                    f"Invalid autotp_size {autotp_size} for world size {world_size}: must divide world size"
+                )
+            data_parallel_size = world_size // autotp_size
+            logger.debug(
+                f"[r{self.rank}] AutoTP sizes -> tp={autotp_size}, data_parallel={data_parallel_size}, world={world_size}"
+            )
+        elif autotp_size > 1:
+            raise ValueError("autotp_size > 1 requires torch.distributed to be initialized")
+
+        # Validate tensor parallelism compatibility with chosen AutoTP size
+        self._validate_tensor_parallelism(model_config, tp_world_size=autotp_size)
+
+        tp_overlap_comm = config.get("tp_overlap_comm", None)
+        tensor_parallel_cfg = {"autotp_size": autotp_size}
+        if tp_overlap_comm is not None:
+            tensor_parallel_cfg["tp_overlap_comm"] = bool(tp_overlap_comm)
+
+        # Initialize DeepSpeed with AutoTP configuration
+        model_engine, optimizer, _, _ = self._initialize_deepspeed(
+            model=model,
+            params=params,
+            config=config,
+            torch_dtype=torch_dtype,
+            tensor_parallel_config=tensor_parallel_cfg,
+        )
+
+        tp_group = None
+        try:
+            tp_group = groups.get_tensor_model_parallel_group()
+        except Exception:
+            tp_group = None
+
+        return model_engine, lm_head, tp_group
 
     def _apply_tensor_parallelism(self, model, lm_head, model_config, device):
         """Apply tensor parallelism to model, lm_head, and return tp_group."""
@@ -676,7 +791,8 @@ class BaseTextTrainer(Trainer):
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
 
         # Compute loss for next-token prediction
-        if getattr(self.model, "tp_group", None):
+        use_tp_loss = self.config.get("parallelism") == "tensor" and getattr(self.model, "tp_group", None)
+        if use_tp_loss:
             import torch.distributed as dist
 
             tp_rank = dist.get_rank(self.model.tp_group)
@@ -713,7 +829,10 @@ class BaseTextTrainer(Trainer):
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} backward_step: computing gradients")
 
         # Backward pass: compute gradients
-        self.loss.backward()
+        if self.use_deepspeed and self.deepspeed_engine is not None:
+            self.deepspeed_engine.backward(self.loss)
+        else:
+            self.loss.backward()
 
         # Extract gradients from vision_embeddings leaf tensor
         if self.vision_embeddings is None or self.vision_embeddings.grad is None:
@@ -846,10 +965,8 @@ class BaseTextTrainer(Trainer):
             logger.error(f"[r{self.rank}] Failed to load checkpoint from {checkpoint_path}: {e}")
             return False
 
-
-@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
-class QwenTextTrainer(BaseTextTrainer):
-    """Qwen2.5-VL text trainer."""
+class QwenTextMixin:
+    """Qwen2.5-VL text model helpers shared by Ray and standalone trainers."""
 
     def _load_model_config(self, model_name):
         """Load Qwen2.5-VL model config."""
@@ -886,3 +1003,9 @@ class QwenTextTrainer(BaseTextTrainer):
             "mlp.up_proj": ColwiseParallel(),
             "mlp.down_proj": RowwiseParallel(),
         }
+
+
+@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
+class QwenTextTrainer(QwenTextMixin, BaseTextTrainer):
+    """Qwen2.5-VL text trainer."""
+    pass

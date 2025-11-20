@@ -118,9 +118,9 @@ class ActorGroup:
         distributed_configs: list[TorchDistributedConfig] = []
 
         for rank in ranks:
-            # When collocating, each actor only sees one GPU (cuda:0) due to Ray's CUDA_VISIBLE_DEVICES
-            # so local_rank should always be 0. Otherwise, local_rank equals the global rank.
-            local_rank = 0 if self.collocate else rank
+            # Each Ray actor gets its own CUDA_VISIBLE_DEVICES with a single entry, so local_rank is always 0
+            # regardless of global rank or collocation.
+            local_rank = 0
 
             distributed_configs.append(
                 TorchDistributedConfig(

@@ -73,7 +73,7 @@ class Trainer(RayActor):
         # Setup reproducibility for tensor/sequence parallelism
         generator = None
         worker_init_fn = None
-        if parallelism in ["tensor", "sequence"]:
+        if parallelism in ["tensor", "sequence", "autotp"]:
             import random as _rnd
 
             import numpy as _np
@@ -406,6 +406,11 @@ class Trainer(RayActor):
                 "sharded_norm_sq": sharded_norm_sq,
             }
 
+        elif parallelism == "autotp":
+            # AutoTP uses DeepSpeed-managed tensor parallel groups; treat like DeepSpeed for clipping
+            norm_sq = self._compute_grad_norm_squared(all_params)
+            return {"type": "deepspeed", "norm_sq": norm_sq}
+
         elif parallelism == "deepspeed":
             # DeepSpeed: check if sequence parallelism is enabled
             # If sequence parallelism is enabled, treat as sequence parallelism
@@ -617,7 +622,7 @@ class Trainer(RayActor):
             f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
         )
 
-    def _initialize_deepspeed(self, model, params, config, torch_dtype, mpu=None):
+    def _initialize_deepspeed(self, model, params, config, torch_dtype, mpu=None, tensor_parallel_config=None):
         """
         Initialize DeepSpeed engine with the given model and parameters.
 
@@ -627,6 +632,7 @@ class Trainer(RayActor):
             config: Training config dict
             torch_dtype: Target dtype (torch.float16 or torch.bfloat16)
             mpu: Optional model/sequence parallel state module to pass into DeepSpeed
+            tensor_parallel_config: Optional tensor parallel configuration (e.g., AutoTP settings)
 
         Returns:
             tuple: (model_engine, optimizer, _, _) from deepspeed.initialize
@@ -663,9 +669,28 @@ class Trainer(RayActor):
             sequence_parallel_world_size = 1
             data_parallel_size = total_world_size
 
-        # Calculate global batch size (batch_size * data_parallel_size * gradient_accumulation_steps)
+        # Handle tensor parallel (AutoTP) world size for correct DP sizing
+        tp_world_size = None
+        if tensor_parallel_config and "autotp_size" in tensor_parallel_config:
+            tp_world_size = int(tensor_parallel_config["autotp_size"])
+            if tp_world_size <= 0:
+                raise ValueError(f"autotp_size must be > 0 (got {tp_world_size})")
+            if total_world_size % tp_world_size != 0:
+                raise ValueError(
+                    f"Total world size {total_world_size} must be divisible by autotp_size {tp_world_size}"
+                )
+            # AutoTP splits the remaining ranks into data parallel groups
+            data_parallel_size = max(1, total_world_size // tp_world_size)
+            if sequence_parallel_world_size > 1:
+                raise ValueError("Sequence parallelism together with AutoTP is not supported in this trainer")
+
+        # Calculate global batch size
         gradient_accumulation_steps = config["gradient_accumulation_steps"]
-        train_batch_size = batch_size * data_parallel_size * gradient_accumulation_steps
+        if tensor_parallel_config:
+            # DeepSpeed expects train_batch_size = micro_batch * grad_acc * total_world_size
+            train_batch_size = batch_size * total_world_size * gradient_accumulation_steps
+        else:
+            train_batch_size = batch_size * data_parallel_size * gradient_accumulation_steps
 
         # Get reduce_bucket_size from config
         reduce_bucket_size = config["reduce_bucket_size"]
@@ -714,6 +739,10 @@ class Trainer(RayActor):
             ds_config.setdefault("communication_data_type", "bf16")
             if sequence_parallel_world_size > 1:
                 ds_config.setdefault("seq_parallel_communication_data_type", "bf16")
+
+        if tensor_parallel_config:
+            ds_config["tensor_parallel"] = tensor_parallel_config
+            ds_config.setdefault("data_parallel_size", data_parallel_size)
 
         rank = getattr(self, "rank", 0)
         if sequence_parallel_world_size > 1:
