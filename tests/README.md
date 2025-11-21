@@ -53,6 +53,14 @@ torchrun --nproc_per_node=2 -m pytest tests/test_text_autotp.py -v
 
 Verifies that DeepSpeed AutoTP (tensor parallelism) produces identical losses and parameter updates compared to a non-parallel baseline. Uses a small Qwen text model (2 layers) and compares replicated parameters (layer norms) after each training step. Tests pure TP mode with ZeRO Stage 1.
 
+### Text model with AutoTP + Data Parallel
+
+```bash
+torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_dp.py -v
+```
+
+Verifies hybrid parallelism combining DeepSpeed AutoTP with Data Parallel (tp_size=2, dp_size=2). Tests that different DP ranks process different data, TP ranks within each DP group synchronize correctly, and parameters are synchronized across DP ranks after optimizer steps.
+
 ## Dataset alignment test
 
 `tests/test_dataset_modalities.py::test_real_dataset_alignment` automatically skips if the COCO validation set defined in `DEFAULT_DATA_REGISTRY` is not present. To exercise it fully, download the dataset referenced in the registry before running `pytest -m cpu_only`.
@@ -76,3 +84,4 @@ Verifies that DeepSpeed AutoTP (tensor parallelism) produces identical losses an
 | `test_vision_compare.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_compare.py -m gpu -v` |
 | `test_vision_detailed.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_detailed.py -m gpu -v` |
 | `test_text_autotp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_text_autotp.py -v` |
+| `test_text_autotp_dp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_dp.py -v` |
