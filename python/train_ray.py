@@ -34,13 +34,15 @@ logger = logging.getLogger(__name__)
 config_dir = str(Path(__file__).parent.parent.parent / "configs")
 
 
-def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict]) -> float:
+def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict], dp_size: int = 1, parallel_size: int = 1) -> float:
     """
     Aggregate gradient norm contributions from all actors to compute global gradient norm.
 
     Args:
         vision_norms: List of norm contribution dicts from vision actors
         text_norms: List of norm contribution dicts from text actors
+        dp_size: Data parallel size
+        parallel_size: TP/SP size per DP replica
 
     Returns:
         global_norm: The global gradient norm (scalar)
@@ -54,23 +56,28 @@ def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict]) -> fl
         parallelism_type = vision_norms[0]["type"]
 
         if parallelism_type == "sequence":
-            # For sequence parallelism, all actors have the same gradient after sync
-            # Just use the first actor's norm (don't sum across actors)
-            total_norm_sq += vision_norms[0]["norm_sq"]
+            # For sequence parallelism + DP:
+            # Within each DP replica, all actors have the same gradient after SP sync
+            # We need to sum contributions from one actor per DP replica
+            # Sample actors: 0, parallel_size, 2*parallel_size, ...
+            for dp_rank in range(dp_size):
+                actor_idx = dp_rank * parallel_size
+                if actor_idx < len(vision_norms):
+                    total_norm_sq += vision_norms[actor_idx]["norm_sq"]
 
         elif parallelism_type == "tensor":
-            # For tensor parallelism:
-            # - Replicated params: all actors have same gradient, use one actor's contribution
-            # - Sharded params: each actor has different shard, already allreduced within TP group
-            # Since we allreduce sharded_norm_sq within the TP group in compute_grad_norm_contribution,
-            # all actors in the same TP group return the same sharded_norm_sq
-            # So we just use the first actor's values
-            replicated_norm_sq = vision_norms[0]["replicated_norm_sq"]
-            sharded_norm_sq = vision_norms[0]["sharded_norm_sq"]
-            total_norm_sq += replicated_norm_sq + sharded_norm_sq
+            # For tensor parallelism + DP:
+            # Within each DP replica: use first actor's replicated + sharded norms
+            # Across DP replicas: sum contributions from each replica
+            for dp_rank in range(dp_size):
+                actor_idx = dp_rank * parallel_size
+                if actor_idx < len(vision_norms):
+                    replicated_norm_sq = vision_norms[actor_idx]["replicated_norm_sq"]
+                    sharded_norm_sq = vision_norms[actor_idx]["sharded_norm_sq"]
+                    total_norm_sq += replicated_norm_sq + sharded_norm_sq
 
         elif parallelism_type == "deepspeed":
-            # For DeepSpeed (ZeRO without sequence parallelism):
+            # For DeepSpeed (AutoTP/SP with DeepSpeed engine + DP):
             # Aggregate norm_sq from all actors
             total_norm_sq += sum(norm["norm_sq"] for norm in vision_norms)
 
@@ -88,12 +95,16 @@ def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict]) -> fl
         parallelism_type = text_norms[0]["type"]
 
         if parallelism_type == "tensor":
-            # Same logic as vision tensor parallelism
-            replicated_norm_sq = text_norms[0]["replicated_norm_sq"]
-            sharded_norm_sq = text_norms[0]["sharded_norm_sq"]
-            total_norm_sq += replicated_norm_sq + sharded_norm_sq
+            # For tensor parallelism + DP: same logic as vision
+            for dp_rank in range(dp_size):
+                actor_idx = dp_rank * parallel_size
+                if actor_idx < len(text_norms):
+                    replicated_norm_sq = text_norms[actor_idx]["replicated_norm_sq"]
+                    sharded_norm_sq = text_norms[actor_idx]["sharded_norm_sq"]
+                    total_norm_sq += replicated_norm_sq + sharded_norm_sq
 
         elif parallelism_type == "deepspeed":
+            # For DeepSpeed (AutoTP with DeepSpeed engine + DP):
             # Aggregate norm_sq from all actors
             total_norm_sq += sum(norm["norm_sq"] for norm in text_norms)
 
@@ -152,11 +163,29 @@ def main(cfg: DictConfig):
         vision_config.update(dict(cfg.deepspeed))
         text_config.update(dict(cfg.deepspeed))
 
+    # Add DP/TP configuration for proper parallelism setup
+    dp_size = cfg.training.get("dp_size", 1)
+    parallel_size = cfg.training.parallel_size  # TP/SP size per DP replica
+
+    # For vision with sequence parallel, set sequence_parallel_size (not world_size)
+    vision_config["sequence_parallel_size"] = parallel_size
+
+    # For text with AutoTP, autotp_size should be parallel_size (not world_size)
+    # If autotp_size is explicitly set in config, respect it; otherwise use parallel_size
+    if text_config.get("parallelism") == "autotp" and text_config.get("autotp_size") is None:
+        text_config["autotp_size"] = parallel_size
+
     # Get number of actors and collocation setting from config
-    parallel_size = cfg.training.parallel_size
+    parallel_size = cfg.training.parallel_size  # TP/SP size per DP replica
+    dp_size = cfg.training.get("dp_size", 1)  # Data parallel size (default: 1)
     collocate = cfg.training.collocate
 
-    logger.info(f"Creating {parallel_size} actors per model (vision and text)")
+    # Calculate total actors needed: dp_size * parallel_size
+    # Each DP replica has parallel_size actors
+    total_actors = dp_size * parallel_size
+
+    logger.info(f"Data Parallel size: {dp_size}, TP/SP size per replica: {parallel_size}")
+    logger.info(f"Creating {total_actors} total actors ({dp_size} DP replicas × {parallel_size} actors/replica)")
     logger.info(f"Collocation enabled: {collocate}")
 
     # Select appropriate trainer classes based on model type
@@ -169,11 +198,11 @@ def main(cfg: DictConfig):
     VisionTrainerClass = get_vision_trainer_class(vision_model_type)
     TextTrainerClass = get_text_trainer_class(text_model_type)
 
-    # Create actor groups
+    # Create actor groups with total_actors (dp_size * parallel_size)
     vision_trainer_group = ActorGroup(
         vision_config,
         VisionTrainerClass,
-        num_actors=parallel_size,
+        num_actors=total_actors,
         collocate=collocate,
     )
 
@@ -181,7 +210,7 @@ def main(cfg: DictConfig):
     text_trainer_group = ActorGroup(
         text_config,
         TextTrainerClass,
-        num_actors=parallel_size,
+        num_actors=total_actors,
         collocate=collocate,
         placement_group_handle=vision_trainer_group.placement_group if collocate else None,
     )
@@ -209,14 +238,15 @@ def main(cfg: DictConfig):
         logger.info(f"Text GPU IDs: {text_gpu_ids}")
 
         # For each vision actor, set receiver info (which text actors it sends to)
-        # Assuming 1-to-1 mapping: vision actor i sends to text actor i
-        for i in range(parallel_size):
+        # Within each DP replica: vision actor i sends to text actor i
+        # Across DP replicas: actor (dp_rank * parallel_size + local_rank) has the same local_rank
+        for i in range(total_actors):
             receiver_gpu_id = text_gpu_ids[i]
-            # Each vision actor sends to the corresponding text actor
+            # Each vision actor sends to the corresponding text actor (same global index)
             vision_trainer_group._actors[i].set_receiver_info.remote([receiver_gpu_id], use_ipc=True)
 
         # For each text actor, set receiver info (which vision actors receive gradients)
-        for i in range(parallel_size):
+        for i in range(total_actors):
             receiver_gpu_id = vision_gpu_ids[i]
             # Each text actor sends gradients back to the corresponding vision actor
             text_trainer_group._actors[i].set_receiver_info.remote([receiver_gpu_id], use_ipc=True)
@@ -314,7 +344,7 @@ def main(cfg: DictConfig):
                 text_norm_refs = text_trainer_group.execute_all_async("compute_grad_norm_contribution")
                 vision_norms = ray.get(vision_norm_refs)
                 text_norms = ray.get(text_norm_refs)
-                global_grad_norm = aggregate_grad_norms(vision_norms, text_norms)
+                global_grad_norm = aggregate_grad_norms(vision_norms, text_norms, dp_size, parallel_size)
 
             # Optimizer steps
             text_trainer_group.execute_all("optimizer_step", global_grad_norm)
