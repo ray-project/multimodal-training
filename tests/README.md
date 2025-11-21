@@ -45,6 +45,14 @@ torchrun --nproc_per_node=2 -m pytest tests/test_vision_detailed.py -m gpu -v
 
 These tests load the Qwen vision encoder (optionally with pretrained weights) and compare outputs across SP configurations. They expect GPUs with BF16 support and access to the `Qwen/Qwen2.5-VL-3B-Instruct` weights (cached locally via Hugging Face).
 
+### Text model with DeepSpeed AutoTP
+
+```bash
+torchrun --nproc_per_node=2 -m pytest tests/test_text_autotp.py -v
+```
+
+Verifies that DeepSpeed AutoTP (tensor parallelism) produces identical losses and parameter updates compared to a non-parallel baseline. Uses a small Qwen text model (2 layers) and compares replicated parameters (layer norms) after each training step. Tests pure TP mode with ZeRO Stage 1.
+
 ## Dataset alignment test
 
 `tests/test_dataset_modalities.py::test_real_dataset_alignment` automatically skips if the COCO validation set defined in `DEFAULT_DATA_REGISTRY` is not present. To exercise it fully, download the dataset referenced in the registry before running `pytest -m cpu_only`.
@@ -67,3 +75,4 @@ These tests load the Qwen vision encoder (optionally with pretrained weights) an
 | `test_split_gather.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_split_gather.py -m gpu -v` |
 | `test_vision_compare.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_compare.py -m gpu -v` |
 | `test_vision_detailed.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_detailed.py -m gpu -v` |
+| `test_text_autotp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_text_autotp.py -v` |
