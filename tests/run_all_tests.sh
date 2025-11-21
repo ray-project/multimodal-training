@@ -78,6 +78,18 @@ else
 
         run_test "Vision model detailed diagnostics (test_vision_detailed.py)" \
                  "torchrun --nproc_per_node=2 -m pytest tests/test_vision_detailed.py -m gpu -v"
+
+        run_test "Text model with DeepSpeed AutoTP" \
+                 "torchrun --nproc_per_node=2 -m pytest tests/test_text_autotp.py -v"
+
+        # Run AutoTP + DP test only if 4+ GPUs available
+        if [ "$GPU_COUNT" -ge 4 ]; then
+            run_test "Text model with AutoTP + Data Parallel" \
+                     "torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_dp.py -v"
+        else
+            echo -e "${YELLOW}Skipping test_text_autotp_dp.py (requires 4+ GPUs, found $GPU_COUNT)${NC}"
+            echo ""
+        fi
     fi
 fi
 

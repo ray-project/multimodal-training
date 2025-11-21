@@ -9,13 +9,12 @@ import torch
 from transformers import AutoProcessor
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_PARENT = REPO_ROOT.parent
-if str(PROJECT_PARENT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_PARENT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from ray_hybrid_para.python.data import DEFAULT_DATA_REGISTRY  # noqa: E402
-from ray_hybrid_para.python.data.config import DataConfig  # noqa: E402
-from ray_hybrid_para.python.data.dataset import LazySupervisedDataset, build_dataloader  # noqa: E402
+from python.data import DEFAULT_DATA_REGISTRY  # noqa: E402
+from python.data.config import DataConfig  # noqa: E402
+from python.data.dataset import LazySupervisedDataset, build_dataloader  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -103,10 +102,10 @@ def dataset_patches(sample_annotations: list[dict]):
     @contextmanager
     def _apply_patches():
         with (
-            patch("ray_hybrid_para.python.data.dataset.get_dataset_configs", side_effect=fake_get_dataset_configs),
-            patch("ray_hybrid_para.python.data.dataset.read_jsonl", side_effect=fake_read_jsonl),
-            patch("ray_hybrid_para.python.data.dataset.preprocess_qwen_visual", side_effect=fake_preprocess),
-            patch("ray_hybrid_para.python.data.dataset.get_rope_index_for_images", side_effect=fake_get_rope_index),
+            patch("python.data.dataset.get_dataset_configs", side_effect=fake_get_dataset_configs),
+            patch("python.data.dataset.read_jsonl", side_effect=fake_read_jsonl),
+            patch("python.data.dataset.preprocess_qwen_visual", side_effect=fake_preprocess),
+            patch("python.data.dataset.get_rope_index_for_images", side_effect=fake_get_rope_index),
         ):
             yield
 
