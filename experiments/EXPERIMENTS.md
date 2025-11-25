@@ -7,16 +7,18 @@ This directory contains scripts for running systematic experiments with differen
 The experiment framework allows you to sweep across various training configurations including:
 - Different model sizes (7B, 32B)
 - Various image sizes (1k to 64k vision tokens)
-- Multiple parallelism strategies (sequence, tensor, DeepSpeed)
+- Multiple parallelism strategies (sequence, tensor, AutoTP)
 - Different batch sizes
+- Data parallel configurations (dp_size)
 
 ## Directory Structure
 
 ```
 experiments/
 ├── EXPERIMENTS.md         # This file
-├── generate_configs.py    # Script to generate config files
-├── run_sweep.sh          # Script to run training sweeps
+├── generate_configs.py    # Script to generate config files and run_sweep.sh
+├── run_sweep.sh          # Generated script to run training sweeps
+├── run_sweep.sh.j2       # Jinja2 template for sweep script generation
 └── train.yaml.j2         # Jinja2 template for config generation
 ```
 
@@ -54,7 +56,9 @@ python experiments/generate_configs.py \
 python experiments/generate_configs.py --output-dir my_configs
 ```
 
-This will generate YAML config files in `configs/` directory.
+This will generate:
+- YAML config files in `configs/` directory
+- `run_sweep.sh` script with a pre-populated list of all generated configs
 
 #### Configuration Options
 
@@ -74,7 +78,11 @@ The script generates configs by combining these parameters:
 
 **Parallelism Strategies:**
 - Vision: sequence, tensor
-- Text: tensor
+- Text: tensor, autotp (DeepSpeed AutoTP)
+
+**Data Parallelism:**
+- dp_size: 1 (default, no data parallelism)
+- Total GPUs = dp_size × parallel_size
 
 **Batch Sizes:** 1, 2, 4, 8
 

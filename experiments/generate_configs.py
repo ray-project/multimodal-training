@@ -22,7 +22,7 @@ sys.path.insert(0, str(project_root))
 
 # Model settings: (model_type, model_name, tp_size, warning)
 MODEL_SETTINGS = [
-    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
+    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
     ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", 8, ""),
 ]
 
@@ -40,8 +40,14 @@ TOKEN_CONFIGS = [
 
 # Parallelism strategies to test
 # Note: "sequence" parallelism is only valid for vision models, not text models
-VISION_PARALLELISM_OPTIONS = ["sequence", "tensor"]
+# VISION_PARALLELISM_OPTIONS = ["sequence", "tensor"]
+# TEXT_PARALLELISM_OPTIONS = ["tensor", "autotp"]
+VISION_PARALLELISM_OPTIONS = ["sequence"]
 TEXT_PARALLELISM_OPTIONS = ["tensor"]
+
+# Data parallel size options (1 = no data parallelism, >1 = replicate model across DP groups)
+# Total GPUs = dp_size * parallel_size
+DP_SIZE_OPTIONS = [1]
 
 # DeepSpeed ZeRO stage (only used when parallelism is "deepspeed")
 VISION_ZERO_STAGE_OPTIONS = [1]
@@ -80,6 +86,12 @@ DEFAULT_TRAINING = {
     "no_checkpoint": True,  # Disable checkpointing (set to True to disable)
     "checkpoint_dir": "/tmp/checkpoints",  # Directory to save/load checkpoints
     "log_interval": 1,  # Log training progress every N iterations
+}
+
+# AutoTP-specific default settings
+DEFAULT_AUTOTP = {
+    "autotp_size": "null",  # null = use parallel_size (set automatically)
+    "tp_overlap_comm": "false",  # Enable TP communication overlap
 }
 
 # Default data parameters
@@ -161,8 +173,12 @@ def generate_config_name(params):
     ckpt_val = params["vision_activation_checkpointing"]
     ckpt = "ckpt" if (ckpt_val == "true" or ckpt_val is True) else "nockpt"
     dtype = params["vision_dtype"]
+    dp_size = params["dp_size"]
 
-    return f"{model_name}_vpar{vision_par}_tpar{text_par}_{token_label}_bs{batch_size}_{attn}_{ckpt}_{dtype}"
+    # Include dp_size in name only if not 1 (to maintain backward compatibility)
+    dp_suffix = f"_dp{dp_size}" if dp_size > 1 else ""
+
+    return f"{model_name}_vpar{vision_par}_tpar{text_par}_{token_label}_bs{batch_size}_{attn}_{ckpt}_{dtype}{dp_suffix}"
 
 
 def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
@@ -200,6 +216,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
         dtype,
         vision_zero_stage,
         text_zero_stage,
+        dp_size,
     ) in product(
         MODEL_SETTINGS,
         TOKEN_CONFIGS,
@@ -212,6 +229,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
         DTYPE_OPTIONS,
         VISION_ZERO_STAGE_OPTIONS,
         TEXT_ZERO_STAGE_OPTIONS,
+        DP_SIZE_OPTIONS,
     ):
 
         # Determine reduce_bucket_size based on token configuration
@@ -238,6 +256,8 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "text_activation_checkpointing": str(act_ckpt).lower(),
             "text_autocast": str(autocast).lower(),
             "text_zero_stage": text_zero_stage,
+            "text_autotp_size": DEFAULT_AUTOTP["autotp_size"],
+            "text_tp_overlap_comm": DEFAULT_AUTOTP["tp_overlap_comm"],
             # Training
             "batch_size": batch_size,
             "learning_rate": DEFAULT_TRAINING["learning_rate"],
@@ -249,7 +269,8 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "weight_decay": DEFAULT_TRAINING["weight_decay"],
             "gradient_accumulation_steps": DEFAULT_TRAINING["gradient_accumulation_steps"],
             "seed": DEFAULT_TRAINING["seed"],
-            "parallel_size": tp_size,  # Use tensor parallel size from MODEL_SETTINGS
+            "dp_size": dp_size,  # Data parallel size
+            "parallel_size": tp_size,  # TP/SP size per DP replica
             "collocate": str(DEFAULT_TRAINING["collocate"]).lower(),
             "clip_grad_norm": str(DEFAULT_TRAINING["clip_grad_norm"]).lower(),
             "max_grad_norm": DEFAULT_TRAINING["max_grad_norm"],
@@ -304,6 +325,32 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             f.write(f"{cfg['name']}\t{cfg['file']}\t{cfg['tp_size']}\t{cfg['warning']}\n")
 
     print(f"Manifest written to {manifest_path}")
+
+    # Generate run_sweep.sh from template
+    sweep_template_path = project_root / "experiments" / "run_sweep.sh.j2"
+    if sweep_template_path.exists():
+        from datetime import datetime
+
+        with open(sweep_template_path) as f:
+            sweep_template = Template(f.read())
+
+        sweep_content = sweep_template.render(
+            configs=configs,
+            num_configs=len(configs),
+            config_dir=output_dir,
+            generation_timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        sweep_script_path = project_root / "experiments" / "run_sweep.sh"
+        with open(sweep_script_path, "w") as f:
+            f.write(sweep_content)
+
+        # Make the script executable
+        sweep_script_path.chmod(0o755)
+
+        print(f"Generated run_sweep.sh with {len(configs)} configs")
+    else:
+        print(f"Warning: run_sweep.sh.j2 template not found at {sweep_template_path}")
 
     return configs
 
