@@ -145,7 +145,21 @@ def create_autotp_trainer(model_config, rank, autotp_size, device, torch_dtype, 
         if isinstance(module, nn.Dropout):
             module.p = 0.0
 
-    # Collect parameters
+    # Apply tensor parallelism with deepspeed.tp_model_init()
+    # This actually shards the model parameters across TP ranks
+    import deepspeed
+
+    params_before = sum(p.numel() for p in model.parameters())
+    print(f"[Rank {rank}] Parameters BEFORE TP sharding: {params_before:,}")
+
+    model = deepspeed.tp_model_init(model, tp_size=autotp_size, dtype=torch_dtype)
+
+    params_after = sum(p.numel() for p in model.parameters())
+    reduction_pct = 100 * (params_before - params_after) / params_before
+    print(f"[Rank {rank}] Parameters AFTER TP sharding: {params_after:,} ({reduction_pct:.1f}% reduction)")
+
+    # Re-collect parameters after TP sharding (shapes have changed)
+    lm_head = model.lm_head
     params = trainer._collect_parameters_from_modules(model, lm_head)
 
     # Determine AutoTP configuration

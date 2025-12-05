@@ -290,17 +290,12 @@ class BaseTextTrainer(Trainer):
         activation_checkpointing = config["activation_checkpointing"]
         self._apply_activation_checkpointing(model, activation_checkpointing, "text model")
 
-        # Tie weights between lm_head and embeddings
-        embed_module = self._get_embedding_module(model)
-        if embed_module is None:
-            raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        # NOTE: Do NOT tie weights here - we'll tie them AFTER tp_model_init()
+        # DeepSpeed AutoTP does NOT shard embed_tokens or lm_head, so simple weight
+        # tying after sharding works correctly.
 
         # Attach lm_head to model so DeepSpeed can manage both
         model.lm_head = lm_head
-
-        # Collect parameters from model and lm_head
-        params = self._collect_parameters_from_modules(model, lm_head)
 
         # Determine AutoTP size (defaults to world size if not provided)
         autotp_size = config.get("autotp_size") or config.get("tensor_parallel_size")
@@ -333,6 +328,7 @@ class BaseTextTrainer(Trainer):
         # This actually shards the model parameters across TP ranks
         # NOTE: set_autotp_mode(training=True) alone only enables tracking but does NOT shard weights.
         # We must call tp_model_init() to perform the actual module injection and weight sharding.
+        # NOTE: DeepSpeed AutoTP does NOT shard embed_tokens or lm_head - only transformer layers.
         import deepspeed
 
         logger.debug(f"[r{self.rank}] Applying TP sharding with deepspeed.tp_model_init (tp_size={autotp_size})...")
@@ -343,9 +339,18 @@ class BaseTextTrainer(Trainer):
         reduction_pct = 100 * (params_before_tp - params_after_tp) / params_before_tp
         logger.debug(f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)")
 
-        # Re-collect parameters after TP sharding (shapes have changed)
-        # The lm_head is attached to model, so we get it from there
+        # Tie weights AFTER tp_model_init()
+        # DeepSpeed AutoTP preserves the original embed_tokens and lm_head modules unsharded,
+        # so simple weight tying works correctly.
+        embed_module = self._get_embedding_module(model)
         lm_head = model.lm_head
+        if embed_module is not None and lm_head is not None:
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
+            logger.debug(f"[r{self.rank}] Tied lm_head weights to embed_tokens after tp_model_init")
+
+        # Re-collect parameters after TP sharding (shapes have changed for transformer layers)
+        # Note: After tying weights, embed_tokens.weight and lm_head.weight are the same object
+        # The helper method will deduplicate to avoid passing the same parameter twice to DeepSpeed
         params = self._collect_parameters_from_modules(model, lm_head)
 
         tp_overlap_comm = config.get("tp_overlap_comm", None)
@@ -815,6 +820,8 @@ class BaseTextTrainer(Trainer):
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
 
         # Compute loss for next-token prediction
+        # Use vocab-parallel loss only for DTensor TP (which produces vocab-sharded logits)
+        # AutoTP does NOT shard lm_head, so it produces full logits and uses standard CE loss
         use_tp_loss = self.config.get("parallelism") == "tensor" and getattr(self.model, "tp_group", None)
         if use_tp_loss:
             import torch.distributed as dist
