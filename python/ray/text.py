@@ -343,6 +343,56 @@ class BaseTextTrainer(Trainer):
         reduction_pct = 100 * (params_before_tp - params_after_tp) / params_before_tp
         logger.debug(f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)")
 
+        # Get TP group early for vocab parallel embedding
+        tp_group = None
+        try:
+            tp_group = groups.get_tensor_model_parallel_group()
+        except Exception:
+            tp_group = None
+
+        # Apply vocabulary-parallel embedding for proper parallel loss computation
+        # DeepSpeed AutoTP doesn't partition embeddings/lm_head by vocabulary dimension,
+        # so we replace them with VocabParallelEmbedding for correct loss computation
+        if tp_group is not None and config.get("use_vocab_parallel", True):
+            tp_rank = groups.get_tensor_model_parallel_rank()
+            tp_world_size = groups.get_tensor_model_parallel_world_size()
+
+            original_embedding = self._get_embedding_module(model)
+            if original_embedding is not None:
+                logger.debug(
+                    f"[r{self.rank}] Replacing embedding with VocabParallelEmbedding "
+                    f"(vocab_size={original_embedding.num_embeddings}, tp_size={tp_world_size})"
+                )
+
+                # Create VocabParallelEmbedding
+                vocab_parallel_embedding = VocabParallelEmbedding(
+                    num_embeddings=original_embedding.num_embeddings,
+                    embedding_dim=original_embedding.embedding_dim,
+                    padding_idx=original_embedding.padding_idx,
+                    tp_group=tp_group,
+                    dtype=original_embedding.weight.dtype,
+                    device=device,
+                )
+
+                # Copy the appropriate partition of weights from original embedding
+                with torch.no_grad():
+                    start_idx = vocab_parallel_embedding.vocab_start_index
+                    end_idx = vocab_parallel_embedding.vocab_end_index
+                    vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
+
+                # Replace the embedding in the model
+                self._replace_embedding_module(model, vocab_parallel_embedding)
+
+                # Update lm_head to use the partitioned embedding weights (tied weights)
+                # The lm_head output dimension should now match the partitioned vocab size
+                lm_head = model.lm_head
+                lm_head.weight = vocab_parallel_embedding.weight
+
+                logger.debug(
+                    f"[r{self.rank}] VocabParallelEmbedding applied: vocab_range=[{start_idx}, {end_idx}), "
+                    f"partition_size={end_idx - start_idx}"
+                )
+
         # Re-collect parameters after TP sharding (shapes have changed)
         # The lm_head is attached to model, so we get it from there
         lm_head = model.lm_head
@@ -361,12 +411,6 @@ class BaseTextTrainer(Trainer):
             torch_dtype=torch_dtype,
             tensor_parallel_config=tensor_parallel_cfg,
         )
-
-        tp_group = None
-        try:
-            tp_group = groups.get_tensor_model_parallel_group()
-        except Exception:
-            tp_group = None
 
         return model_engine, lm_head, tp_group
 
@@ -815,7 +859,12 @@ class BaseTextTrainer(Trainer):
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
 
         # Compute loss for next-token prediction
-        use_tp_loss = self.config.get("parallelism") == "tensor" and getattr(self.model, "tp_group", None)
+        # Use vocab_parallel_causal_cross_entropy for tensor parallelism (DTensor) or AutoTP with vocab_parallel
+        parallelism = self.config.get("parallelism")
+        tp_group = getattr(self.model, "tp_group", None)
+        use_tp_loss = tp_group is not None and (
+            parallelism == "tensor" or (parallelism == "autotp" and self.config.get("use_vocab_parallel", True))
+        )
         if use_tp_loss:
             import torch.distributed as dist
 

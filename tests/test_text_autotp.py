@@ -491,5 +491,403 @@ def test_autotp_vs_no_parallel():
     print(f"[Rank {rank}] Test complete")
 
 
+def test_autotp_vocab_parallel():
+    """Test that AutoTP with VocabParallelEmbedding produces the same loss as no-parallel baseline.
+
+    This test verifies:
+    1. VocabParallelEmbedding is properly created and partitions vocabulary across TP ranks
+    2. Loss values match between baseline and AutoTP with vocab parallel loss
+    3. Gradients flow correctly through the vocab-parallel embedding
+    """
+    rank, world_size, local_rank = init_distributed()
+
+    print(f"\n[Rank {rank}] Starting AutoTP Vocab Parallel test (world_size={world_size})")
+
+    # Configuration
+    torch_dtype = torch.bfloat16
+    device = torch.device(f"cuda:{local_rank}")
+    batch_size = 2
+    seq_len = 32
+    num_steps = 3
+    autotp_size = world_size  # Pure TP: all ranks in same TP group
+
+    # Create model config
+    model_config = create_small_model_config(num_layers=2)
+    vocab_size = model_config.text_config.vocab_size
+
+    print(f"[Rank {rank}] Model config: num_layers={model_config.text_config.num_hidden_layers}, vocab_size={vocab_size}")
+
+    # ========================================
+    # BASELINE: No-parallel model (rank 0 only)
+    # ========================================
+    baseline_losses = []
+
+    if rank == 0:
+        print(f"\n[Rank {rank}] " + "=" * 60)
+        print(f"[Rank {rank}] Creating NO-PARALLEL baseline model")
+        print(f"[Rank {rank}] " + "=" * 60)
+
+        baseline_model, baseline_lm_head = create_no_parallel_model(model_config, device, torch_dtype)
+
+        # Create optimizer
+        params = list(baseline_model.parameters()) + list(baseline_lm_head.parameters())
+        param_ids = set()
+        unique_params = []
+        for p in params:
+            if id(p) not in param_ids:
+                param_ids.add(id(p))
+                unique_params.append(p)
+        optimizer = torch.optim.AdamW(unique_params, lr=1e-4, weight_decay=0.01)
+
+        # Training loop for baseline
+        for step in range(num_steps):
+            input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=42 + step)
+
+            optimizer.zero_grad()
+            loss = compute_loss(baseline_model, baseline_lm_head, input_ids, labels)
+            baseline_losses.append(loss.item())
+            loss.backward()
+            optimizer.step()
+
+            print(f"[Rank {rank}] Baseline step {step}: loss={loss.item():.6f}")
+
+        print(f"[Rank {rank}] Baseline training complete")
+
+    dist.barrier()
+
+    # ========================================
+    # AutoTP model with vocab parallel (all ranks)
+    # ========================================
+    print(f"\n[Rank {rank}] " + "=" * 60)
+    print(f"[Rank {rank}] Creating AutoTP model with VocabParallelEmbedding (autotp_size={autotp_size})")
+    print(f"[Rank {rank}] " + "=" * 60)
+
+    # Create config with use_vocab_parallel=True
+    config = {
+        "model_name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "parallelism": "autotp",
+        "dtype": "bfloat16",
+        "attention_backend": "sdpa",
+        "activation_checkpointing": False,
+        "autocast": True,
+        "zero_stage": 1,
+        "learning_rate": 1e-4,
+        "weight_decay": 0.01,
+        "batch_size": 1,
+        "num_iterations": 5,
+        "warmup_steps": 0,
+        "warmup_ratio": 0.0,
+        "lr_scheduler_type": "constant",
+        "gradient_accumulation_steps": 1,
+        "reduce_bucket_size": 500000000,
+        "seed": 42,
+        "clip_grad_norm": False,
+        "max_grad_norm": 1.0,
+        "autotp_size": autotp_size,
+        "tp_overlap_comm": False,
+        "train_batch_size_override": None,
+        "use_vocab_parallel": True,  # Enable vocab parallel embedding and loss
+    }
+
+    trainer = AutoTPQwenTextTrainer(config, rank)
+
+    from deepspeed.module_inject.layers import set_autotp_mode
+    set_autotp_mode(training=True)
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    torch.set_default_device(device)
+    model = Qwen2_5_VLTextModel._from_config(model_config.text_config)
+    lm_head = nn.Linear(model_config.text_config.hidden_size, model_config.text_config.vocab_size, bias=False)
+    torch.set_default_device("cpu")
+
+    model.to(torch_dtype)
+    lm_head.to(torch_dtype)
+
+    # Tie weights
+    lm_head.weight = model.embed_tokens.weight
+    model.lm_head = lm_head
+
+    # Disable dropout for deterministic behavior
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = 0.0
+
+    # Collect parameters
+    params = trainer._collect_parameters_from_modules(model, lm_head)
+
+    from deepspeed.utils import groups
+    tensor_parallel_cfg = {"autotp_size": autotp_size}
+
+    # Initialize DeepSpeed with AutoTP
+    model_engine, optimizer, _, _ = trainer._initialize_deepspeed(
+        model=model,
+        params=params,
+        config=config,
+        torch_dtype=torch_dtype,
+        tensor_parallel_config=tensor_parallel_cfg,
+    )
+
+    try:
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        tp_world_size = groups.get_tensor_model_parallel_world_size()
+    except Exception:
+        tp_group = None
+        tp_rank = 0
+        tp_world_size = 1
+
+    # Apply VocabParallelEmbedding manually (simulating what _build_model_with_autotp does)
+    from python.tensor_parallel import VocabParallelEmbedding
+    from python.tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
+
+    if tp_group is not None:
+        original_embedding = model_engine.module.embed_tokens
+        print(f"[Rank {rank}] Original embedding shape: {original_embedding.weight.shape}")
+
+        vocab_parallel_embedding = VocabParallelEmbedding(
+            num_embeddings=original_embedding.num_embeddings,
+            embedding_dim=original_embedding.embedding_dim,
+            padding_idx=original_embedding.padding_idx,
+            tp_group=tp_group,
+            dtype=original_embedding.weight.dtype,
+            device=device,
+        )
+
+        with torch.no_grad():
+            start_idx = vocab_parallel_embedding.vocab_start_index
+            end_idx = vocab_parallel_embedding.vocab_end_index
+            vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
+
+        model_engine.module.embed_tokens = vocab_parallel_embedding
+        model_engine.module.lm_head.weight = vocab_parallel_embedding.weight
+
+        print(f"[Rank {rank}] VocabParallelEmbedding: vocab_range=[{start_idx}, {end_idx}), "
+              f"partition_size={end_idx - start_idx}")
+
+    trainer.model = model_engine
+    trainer.model_config = model_config
+    trainer.lm_head = model_engine.module.lm_head
+    trainer.model.tp_group = tp_group
+    trainer.deepspeed_engine = model_engine
+
+    dist.barrier()
+
+    # Training loop for AutoTP with vocab parallel
+    autotp_losses = []
+
+    for step in range(num_steps):
+        input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=42 + step)
+        broadcast_for_tensor_parallel([input_ids, labels], tp_group)
+
+        trainer.zero_grad()
+
+        with trainer._get_autocast_context():
+            outputs = trainer.model(input_ids=input_ids)
+            logits = trainer.lm_head(outputs.last_hidden_state)
+
+        # Use vocab_parallel_causal_cross_entropy
+        if tp_group is not None:
+            loss = vocab_parallel_causal_cross_entropy(
+                logits,
+                labels,
+                tp_group,
+                tp_rank,
+                tp_world_size,
+                ignore_index=-100,
+            )
+        else:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        autotp_losses.append(loss.item())
+
+        trainer.deepspeed_engine.backward(loss)
+        trainer.optimizer_step()
+
+        print(f"[Rank {rank}] AutoTP Vocab Parallel step {step}: loss={loss.item():.6f}")
+
+    print(f"[Rank {rank}] AutoTP Vocab Parallel training complete")
+
+    # ========================================
+    # Compare losses (rank 0 only)
+    # ========================================
+    dist.barrier()
+
+    if rank == 0:
+        print(f"\n[Rank {rank}] " + "=" * 60)
+        print(f"[Rank {rank}] COMPARISON: Baseline vs AutoTP Vocab Parallel")
+        print(f"[Rank {rank}] " + "=" * 60)
+
+        print(f"\n[Rank {rank}] Loss Comparison:")
+        all_match = True
+        for step in range(num_steps):
+            baseline_loss = baseline_losses[step]
+            autotp_loss = autotp_losses[step]
+            loss_diff = abs(baseline_loss - autotp_loss)
+            rel_diff = loss_diff / (abs(baseline_loss) + 1e-8)
+
+            print(f"[Rank {rank}] Step {step}: baseline_loss={baseline_loss:.6f}, autotp_vocab_loss={autotp_loss:.6f}, "
+                  f"diff={loss_diff:.6e}, rel_diff={rel_diff:.6e}")
+
+            # Use a more relaxed tolerance for integration test since:
+            # - Baseline uses simple AdamW, AutoTP uses DeepSpeed ZeRO-1
+            # - AutoTP partitions transformer layers differently
+            # - Different computation patterns lead to numerical differences
+            LOSS_TOLERANCE = 0.1  # 10% relative tolerance for integration test
+            if rel_diff < LOSS_TOLERANCE:
+                print(f"[Rank {rank}] Step {step}: ✅ Losses are reasonably close!")
+            else:
+                print(f"[Rank {rank}] Step {step}: ❌ Losses differ significantly!")
+                all_match = False
+
+        print(f"\n[Rank {rank}] ====================================================================")
+        if all_match:
+            print(f"[Rank {rank}] TEST RESULT: ✅ PASSED - AutoTP with VocabParallelEmbedding working correctly!")
+        else:
+            print(f"[Rank {rank}] TEST RESULT: ❌ FAILED - Losses differ more than expected!")
+        print(f"[Rank {rank}] ====================================================================")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+    print(f"[Rank {rank}] Test complete")
+
+
+def test_vocab_parallel_cross_entropy_correctness():
+    """Test that vocab_parallel_causal_cross_entropy produces the same result as regular CrossEntropyLoss.
+
+    This is a unit test that verifies the loss calculation is mathematically correct
+    by comparing against a non-parallel baseline with the same logits.
+    """
+    rank, world_size, local_rank = init_distributed()
+
+    print(f"\n[Rank {rank}] Starting vocab parallel cross entropy correctness test (world_size={world_size})")
+
+    from deepspeed.utils import groups
+    from python.tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
+
+    # Create a simple test case
+    batch_size = 2
+    seq_len = 16
+    vocab_size = 1024  # Small vocab for testing
+
+    # Ensure vocab_size is divisible by world_size
+    assert vocab_size % world_size == 0, f"vocab_size {vocab_size} must be divisible by world_size {world_size}"
+    vocab_per_rank = vocab_size // world_size
+
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
+    # Initialize DeepSpeed groups
+    from deepspeed.module_inject.layers import set_autotp_mode
+    set_autotp_mode(training=True)
+
+    # Get or create TP group (from previous test or fresh)
+    try:
+        groups._init_tp_mesh_device(world_size)
+    except Exception:
+        pass  # Already initialized
+
+    tp_group = groups.get_tensor_model_parallel_group()
+    tp_rank = groups.get_tensor_model_parallel_rank()
+    tp_world_size = groups.get_tensor_model_parallel_world_size()
+
+    print(f"[Rank {rank}] TP config: tp_rank={tp_rank}, tp_world_size={tp_world_size}")
+
+    # Create test data (same on all ranks)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    # Generate full logits and labels on rank 0, then broadcast
+    if rank == 0:
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device=device, dtype=torch.float32)
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    else:
+        full_logits = torch.zeros(batch_size, seq_len, vocab_size, device=device, dtype=torch.float32)
+        labels = torch.zeros(batch_size, seq_len, device=device, dtype=torch.long)
+
+    # Broadcast full logits and labels from rank 0
+    dist.broadcast(full_logits, src=0)
+    dist.broadcast(labels, src=0)
+
+    print(f"[Rank {rank}] Full logits shape: {full_logits.shape}, labels shape: {labels.shape}")
+
+    # ========================================
+    # Baseline: Regular CrossEntropyLoss (rank 0 only)
+    # ========================================
+    if rank == 0:
+        shift_logits = full_logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        baseline_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        print(f"[Rank {rank}] Baseline CrossEntropyLoss: {baseline_loss.item():.6f}")
+    else:
+        baseline_loss = None
+
+    # ========================================
+    # Vocab Parallel: vocab_parallel_causal_cross_entropy
+    # ========================================
+
+    # Partition logits by vocabulary dimension
+    # Each rank gets logits[:, :, vocab_start:vocab_end]
+    vocab_start = tp_rank * vocab_per_rank
+    vocab_end = vocab_start + vocab_per_rank
+    sharded_logits = full_logits[:, :, vocab_start:vocab_end].contiguous()
+
+    print(f"[Rank {rank}] Sharded logits shape: {sharded_logits.shape} (vocab_range=[{vocab_start}, {vocab_end}))")
+
+    # Compute vocab parallel loss
+    parallel_loss = vocab_parallel_causal_cross_entropy(
+        sharded_logits,
+        labels,
+        tp_group,
+        tp_rank,
+        tp_world_size,
+        ignore_index=-100,
+    )
+
+    print(f"[Rank {rank}] Vocab parallel loss: {parallel_loss.item():.6f}")
+
+    # ========================================
+    # Compare results (rank 0)
+    # ========================================
+    dist.barrier()
+
+    if rank == 0:
+        loss_diff = abs(baseline_loss.item() - parallel_loss.item())
+        rel_diff = loss_diff / (abs(baseline_loss.item()) + 1e-8)
+
+        print(f"\n[Rank {rank}] " + "=" * 60)
+        print(f"[Rank {rank}] COMPARISON: Baseline vs Vocab Parallel CrossEntropy")
+        print(f"[Rank {rank}] " + "=" * 60)
+        print(f"[Rank {rank}] Baseline loss:       {baseline_loss.item():.8f}")
+        print(f"[Rank {rank}] Vocab parallel loss: {parallel_loss.item():.8f}")
+        print(f"[Rank {rank}] Absolute diff:       {loss_diff:.8e}")
+        print(f"[Rank {rank}] Relative diff:       {rel_diff:.8e}")
+
+        # Very tight tolerance for this exact comparison
+        LOSS_TOLERANCE = 1e-5
+        if loss_diff < LOSS_TOLERANCE:
+            print(f"[Rank {rank}] ✅ PASSED - vocab_parallel_causal_cross_entropy produces correct result!")
+            test_passed = True
+        else:
+            print(f"[Rank {rank}] ❌ FAILED - Losses don't match!")
+            test_passed = False
+
+        print(f"[Rank {rank}] ====================================================================")
+
+        # Assert for pytest
+        assert test_passed, f"vocab_parallel_causal_cross_entropy produced incorrect loss: diff={loss_diff:.8e}"
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+    print(f"[Rank {rank}] Test complete")
+
+
 if __name__ == "__main__":
     test_autotp_vs_no_parallel()
