@@ -325,6 +325,29 @@ class BaseTextTrainer(Trainer):
         # Validate tensor parallelism compatibility with chosen AutoTP size
         self._validate_tensor_parallelism(model_config, tp_world_size=autotp_size)
 
+        # Count parameters before TP sharding for logging
+        params_before_tp = sum(p.numel() for p in model.parameters())
+        logger.debug(f"[r{self.rank}] Parameters BEFORE TP sharding: {params_before_tp:,}")
+
+        # Apply tensor parallelism with deepspeed.tp_model_init()
+        # This actually shards the model parameters across TP ranks
+        # NOTE: set_autotp_mode(training=True) alone only enables tracking but does NOT shard weights.
+        # We must call tp_model_init() to perform the actual module injection and weight sharding.
+        import deepspeed
+
+        logger.debug(f"[r{self.rank}] Applying TP sharding with deepspeed.tp_model_init (tp_size={autotp_size})...")
+        model = deepspeed.tp_model_init(model, tp_size=autotp_size, dtype=torch_dtype)
+
+        # Count parameters after TP sharding
+        params_after_tp = sum(p.numel() for p in model.parameters())
+        reduction_pct = 100 * (params_before_tp - params_after_tp) / params_before_tp
+        logger.debug(f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)")
+
+        # Re-collect parameters after TP sharding (shapes have changed)
+        # The lm_head is attached to model, so we get it from there
+        lm_head = model.lm_head
+        params = self._collect_parameters_from_modules(model, lm_head)
+
         tp_overlap_comm = config.get("tp_overlap_comm", None)
         tensor_parallel_cfg = {"autotp_size": autotp_size}
         if tp_overlap_comm is not None:
