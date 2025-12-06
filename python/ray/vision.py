@@ -1,4 +1,5 @@
 import logging
+import time
 from abc import abstractmethod
 from collections import deque
 
@@ -274,13 +275,19 @@ class BaseVisionTrainer(Trainer):
         # Collect parameters from model and projector
         params = self._collect_parameters_from_modules(model, projector)
 
-        # Initialize with DeepSpeed using base class method
+        # Create the optimizer externally to ensure consistency with DTensor path
+        # This uses the same _build_optimizer logic (Adam with proper weight decay groups)
+        self._build_optimizer(params)
+        external_optimizer = self.optimizer
+
+        # Initialize with DeepSpeed using base class method and external optimizer
         model_engine, optimizer, _, _ = self._initialize_deepspeed(
             model=model,
             params=params,
             config=config,
             torch_dtype=torch_dtype,
             mpu=mpu_module,
+            optimizer=external_optimizer,
         )
 
         # Return the engine in place of model (projector stays separate)
@@ -388,14 +395,14 @@ class BaseVisionTrainer(Trainer):
         logger.debug(f"[r{self.rank}] Vision model built successfully")
 
         # Build optimizer with both model and projector parameters
-        # Skip if using DeepSpeed (optimizer is created by DeepSpeed)
+        # Skip if using DeepSpeed - optimizer is created in build methods
         if not self.use_deepspeed:
             params = list(self.model.parameters())
             if self.projector is not None:
                 params.extend(list(self.projector.parameters()))
             self._build_optimizer(params)
         else:
-            logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
+            logger.debug(f"[r{self.rank}] Using external optimizer with DeepSpeed (already created)")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
         self._build_scheduler(self.config["num_iterations"])
@@ -429,6 +436,8 @@ class BaseVisionTrainer(Trainer):
         Args:
             iteration: Training iteration number for synchronization verification
         """
+        forward_start = time.perf_counter()
+
         # Store iteration for verification
         self._current_iteration = iteration
 
@@ -456,6 +465,10 @@ class BaseVisionTrainer(Trainer):
         # Call subclass-specific forward
         vision_outputs = self._model_forward(batch)
 
+        # Synchronize to get accurate timing
+        torch.cuda.synchronize()
+        forward_time_ms = (time.perf_counter() - forward_start) * 1000
+
         # Enqueue outputs for backward pass (supports multiple outstanding microbatches)
         self._pending_outputs.append(vision_outputs)
 
@@ -464,6 +477,7 @@ class BaseVisionTrainer(Trainer):
             "vision_embeddings": vision_outputs,
             "sample_index": sample_index,
             "iteration": iteration,
+            "forward_time_ms": forward_time_ms,
         }
 
         # Use CUDA IPC if configured
@@ -490,6 +504,13 @@ class BaseVisionTrainer(Trainer):
             vision_grad_data = ray.get(vision_grad_ref)
         else:
             vision_grad_data = vision_grad_ref
+
+        # Handle new dict format from text backward_step: {"grad": ..., "backward_time_ms": ...}
+        if isinstance(vision_grad_data, dict) and "grad" in vision_grad_data:
+            vision_grad_data = vision_grad_data["grad"]
+
+        if vision_grad_data is None:
+            return None
 
         if isinstance(vision_grad_data, dict) and "use_ipc" in vision_grad_data:
             transfer_request = TensorTransferRequest.from_dict(vision_grad_data)
@@ -539,8 +560,16 @@ class BaseVisionTrainer(Trainer):
 
     def backward_step(self, vision_grad_ref):
         """Run backward pass on the vision model."""
+        backward_start = time.perf_counter()
+
         vision_grad = self._retrieve_gradient_tensor(vision_grad_ref)
-        return self._apply_vision_backward(vision_grad)
+        self._apply_vision_backward(vision_grad)
+
+        # Synchronize to get accurate timing
+        torch.cuda.synchronize()
+        backward_time_ms = (time.perf_counter() - backward_start) * 1000
+
+        return {"backward_time_ms": backward_time_ms}
 
     def save_checkpoint(self, checkpoint_dir: str, epoch: int):
         """

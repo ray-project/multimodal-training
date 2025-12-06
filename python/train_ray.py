@@ -325,17 +325,41 @@ def main(cfg: DictConfig):
             # Text forward pass
             iteration_list = [global_step] * len(vision_refs)
             text_refs = text_trainer_group.execute_all_async("forward_step", vision_refs, iteration_list)
-            losses = ray.get(text_refs)
+            text_forward_results = ray.get(text_refs)
 
-            # Extract loss values
-            loss_values = [loss.item() if torch.is_tensor(loss) else loss for loss in losses]
+            # Extract loss values and timing info
+            loss_values = []
+            text_fwd_times = []
+            vision_fwd_times = []
+            for result in text_forward_results:
+                if isinstance(result, dict):
+                    loss = result.get("loss")
+                    loss_values.append(loss.item() if torch.is_tensor(loss) else loss)
+                    text_fwd_times.append(result.get("forward_time_ms", 0.0))
+                    vision_fwd_times.append(result.get("vision_forward_time_ms", 0.0))
+                else:
+                    # Backwards compatibility
+                    loss_values.append(result.item() if torch.is_tensor(result) else result)
             avg_loss = sum(loss_values) / len(loss_values) if loss_values else 0.0
             epoch_loss += avg_loss
 
             # Backward pass
             text_backward_refs = text_trainer_group.execute_all_async("backward_step")
             vision_backward_refs = vision_trainer_group.execute_all_async("backward_step", text_backward_refs)
-            ray.get(vision_backward_refs)
+
+            # Get timing from backward passes
+            vision_backward_results = ray.get(vision_backward_refs)
+            text_backward_results = ray.get(text_backward_refs)
+
+            # Extract backward timing
+            vision_bwd_times = [r.get("backward_time_ms", 0.0) for r in vision_backward_results if isinstance(r, dict)]
+            text_bwd_times = [r.get("backward_time_ms", 0.0) for r in text_backward_results if isinstance(r, dict)]
+
+            # Compute average timings across actors
+            avg_vision_fwd_ms = sum(vision_fwd_times) / len(vision_fwd_times) if vision_fwd_times else 0.0
+            avg_vision_bwd_ms = sum(vision_bwd_times) / len(vision_bwd_times) if vision_bwd_times else 0.0
+            avg_text_fwd_ms = sum(text_fwd_times) / len(text_fwd_times) if text_fwd_times else 0.0
+            avg_text_bwd_ms = sum(text_bwd_times) / len(text_bwd_times) if text_bwd_times else 0.0
 
             # Gradient clipping (if enabled)
             global_grad_norm = None
@@ -350,6 +374,18 @@ def main(cfg: DictConfig):
             text_trainer_group.execute_all("optimizer_step", global_grad_norm)
             vision_trainer_group.execute_all("optimizer_step", global_grad_norm)
 
+            # Gather memory stats after optimizer step
+            vision_mem_refs = vision_trainer_group.execute_all_async("get_memory_stats")
+            text_mem_refs = text_trainer_group.execute_all_async("get_memory_stats")
+            vision_mem_stats = ray.get(vision_mem_refs)
+            text_mem_stats = ray.get(text_mem_refs)
+
+            # Average memory stats across actors
+            avg_vision_alloc_mb = sum(s["allocated_mb"] for s in vision_mem_stats) / len(vision_mem_stats)
+            avg_vision_peak_mb = sum(s["peak_mb"] for s in vision_mem_stats) / len(vision_mem_stats)
+            avg_text_alloc_mb = sum(s["allocated_mb"] for s in text_mem_stats) / len(text_mem_stats)
+            avg_text_peak_mb = sum(s["peak_mb"] for s in text_mem_stats) / len(text_mem_stats)
+
             if measure_metrics and iteration_start is not None:
                 iteration_elapsed = time.perf_counter() - iteration_start
                 iteration_times.append(iteration_elapsed)
@@ -357,10 +393,29 @@ def main(cfg: DictConfig):
             # Log at specified interval
             if (iteration + 1) % log_interval == 0 or iteration == 0:
                 status = "warmup" if global_step < warmup_steps else "training"
-                logger.info(
-                    f"Epoch {epoch + 1}/{num_epochs}, Iter {iteration + 1}/{num_iterations} "
-                    f"({status}) - Loss: {avg_loss:.4f}"
+                mem_info = (
+                    f"Vision mem: {avg_vision_alloc_mb:.0f}MB (peak {avg_vision_peak_mb:.0f}MB), "
+                    f"Text mem: {avg_text_alloc_mb:.0f}MB (peak {avg_text_peak_mb:.0f}MB)"
                 )
+                if measure_metrics and iteration_start is not None:
+                    iter_time = time.perf_counter() - iteration_start
+                    logger.info(
+                        f"Epoch {epoch + 1}/{num_epochs}, Iter {iteration + 1}/{num_iterations} "
+                        f"({status}) - Loss: {avg_loss:.4f}, Iteration time: {iter_time:.3f}s, "
+                        f"Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
+                        f"Text fwd: {avg_text_fwd_ms:.1f}ms, Text bwd: {avg_text_bwd_ms:.1f}ms, "
+                        f"{mem_info}"
+                    )
+                else:
+                    logger.info(
+                        f"Epoch {epoch + 1}/{num_epochs}, Iter {iteration + 1}/{num_iterations} "
+                        f"({status}) - Loss: {avg_loss:.4f}, "
+                        f"Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
+                        f"Text fwd: {avg_text_fwd_ms:.1f}ms, Text bwd: {avg_text_bwd_ms:.1f}ms, "
+                        f"{mem_info}"
+                    )
+            if iteration > 100:
+                break
 
             global_step += 1
 

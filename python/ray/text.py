@@ -1,4 +1,5 @@
 import logging
+import time
 from abc import abstractmethod
 
 import ray
@@ -235,12 +236,18 @@ class BaseTextTrainer(Trainer):
         # The helper method will deduplicate to avoid passing the same parameter twice to DeepSpeed
         params = self._collect_parameters_from_modules(model, lm_head)
 
-        # Initialize with DeepSpeed using base class method
+        # Create the optimizer externally to ensure consistency with DTensor path
+        # This uses the same _build_optimizer logic (Adam with proper weight decay groups)
+        self._build_optimizer(params)
+        external_optimizer = self.optimizer
+
+        # Initialize with DeepSpeed using base class method and external optimizer
         model_engine, optimizer, _, _ = self._initialize_deepspeed(
             model=model,
             params=params,
             config=config,
             torch_dtype=torch_dtype,
+            optimizer=external_optimizer,
         )
 
         # Return the engine in place of model (lm_head stays separate, tp_group is None)
@@ -398,18 +405,24 @@ class BaseTextTrainer(Trainer):
         lm_head = model.lm_head
         params = self._collect_parameters_from_modules(model, lm_head)
 
+        # Create the optimizer externally to ensure consistency with DTensor path
+        # This uses the same _build_optimizer logic (Adam with proper weight decay groups)
+        self._build_optimizer(params)
+        external_optimizer = self.optimizer
+
         tp_overlap_comm = config.get("tp_overlap_comm", None)
         tensor_parallel_cfg = {"autotp_size": autotp_size}
         if tp_overlap_comm is not None:
             tensor_parallel_cfg["tp_overlap_comm"] = bool(tp_overlap_comm)
 
-        # Initialize DeepSpeed with AutoTP configuration
+        # Initialize DeepSpeed with AutoTP configuration and external optimizer
         model_engine, optimizer, _, _ = self._initialize_deepspeed(
             model=model,
             params=params,
             config=config,
             torch_dtype=torch_dtype,
             tensor_parallel_config=tensor_parallel_cfg,
+            optimizer=external_optimizer,
         )
 
         return model_engine, lm_head, tp_group
@@ -561,11 +574,11 @@ class BaseTextTrainer(Trainer):
 
         self.model.tp_group = tp_group
 
-        # Build optimizer (skip if using DeepSpeed)
+        # Build optimizer (skip if using DeepSpeed - optimizer is created in build methods)
         if not self.use_deepspeed:
             self._build_optimizer(self._collect_optimizer_parameters())
         else:
-            logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
+            logger.debug(f"[r{self.rank}] Using external optimizer with DeepSpeed (already created)")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
         self._build_scheduler(self.config["num_iterations"])
@@ -639,8 +652,10 @@ class BaseTextTrainer(Trainer):
             iteration: Training iteration number for synchronization verification
 
         Returns:
-            Loss value (scalar tensor)
+            Dict with "loss" (scalar tensor) and "forward_time_ms" (float)
         """
+        forward_start = time.perf_counter()
+
         # Store iteration for verification
         self._current_iteration = iteration
         logger.debug(f"[r{self.rank}] Text forward_step: iteration={iteration}")
@@ -688,7 +703,20 @@ class BaseTextTrainer(Trainer):
         # Each rank owns gradients for its own microbatch
         self._vision_grad_owner_rank = self.rank
 
-        return self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
+        # Get vision forward timing if available
+        vision_forward_time_ms = vision_data.get("forward_time_ms", 0.0)
+
+        loss = self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
+
+        # Synchronize to get accurate timing
+        torch.cuda.synchronize()
+        forward_time_ms = (time.perf_counter() - forward_start) * 1000
+
+        return {
+            "loss": loss,
+            "forward_time_ms": forward_time_ms,
+            "vision_forward_time_ms": vision_forward_time_ms,
+        }
 
     def _forward_step_impl(self, vision_embeddings, vision_sample_index=None, iteration=-1):
         """
@@ -895,10 +923,11 @@ class BaseTextTrainer(Trainer):
         Run backward pass on the text model.
 
         Returns:
-            Gradients w.r.t. vision embeddings to be passed back to VisionTrainer.
-            If CUDA IPC is enabled, returns a TensorTransferRequest dict.
-            Otherwise returns the gradient tensor directly.
+            Dict with "grad" (gradients w.r.t. vision embeddings or TensorTransferRequest dict)
+            and "backward_time_ms" (float).
         """
+        backward_start = time.perf_counter()
+
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} backward_step: computing gradients")
 
         # Backward pass: compute gradients
@@ -906,6 +935,10 @@ class BaseTextTrainer(Trainer):
             self.deepspeed_engine.backward(self.loss)
         else:
             self.loss.backward()
+
+        # Synchronize to get accurate timing
+        torch.cuda.synchronize()
+        backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
         # Extract gradients from vision_embeddings leaf tensor
         if self.vision_embeddings is None or self.vision_embeddings.grad is None:
@@ -932,7 +965,7 @@ class BaseTextTrainer(Trainer):
         self.vision_embeddings = None
 
         if grad_to_send is None:
-            return None
+            return {"grad": None, "backward_time_ms": backward_time_ms}
 
         # Use CUDA IPC if configured and receiver info is available
         if self.use_ipc and self.receiver_gpu_ids is not None:
@@ -949,10 +982,10 @@ class BaseTextTrainer(Trainer):
             logger.debug(
                 f"[r{self.rank}] {self.__class__.__name__}: Created gradient transfer request (use_ipc={transfer_request.use_ipc})"
             )
-            return transfer_request.to_dict()
+            return {"grad": transfer_request.to_dict(), "backward_time_ms": backward_time_ms}
         else:
             # Return gradients directly (Ray's default transport)
-            return grad_to_send
+            return {"grad": grad_to_send, "backward_time_ms": backward_time_ms}
 
     def zero_grad(self):
         """Zero out model and lm_head gradients to free memory."""
