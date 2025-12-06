@@ -77,6 +77,26 @@ torchrun --nproc_per_node=4 -m pytest tests/test_vision_sp_dp.py -v
 
 Verifies hybrid parallelism combining DeepSpeed Sequence Parallel with Data Parallel for the vision model (sp_size=2, dp_size=2). Tests that different DP ranks process different data, SP ranks within each DP group synchronize correctly, and parameters are synchronized across DP ranks after optimizer steps.
 
+### DTensor vs AutoTP Layer Comparison
+
+```bash
+# Main test (via pytest)
+torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_layer.py -v -s
+
+# Detailed timing test (standalone, more iterations)
+torchrun --nproc_per_node=4 python tests/test_text_autotp_layer.py detailed
+```
+
+Compares a single transformer layer between DTensor (ColwiseParallel/RowwiseParallel) and DeepSpeed AutoTP implementations. Uses hook-based profiling to measure fine-grained timing for each component (attention projections, MLP projections, layer norms). Verifies that both implementations produce identical outputs and losses. Useful for debugging performance differences between TP implementations.
+
+Key features:
+- Fine-grained timing breakdown for each layer component
+- Forward and backward pass profiling
+- Output and gradient comparison
+- Uses minimal 1-layer model for focused testing
+
+Note: The detailed timing test is skipped by pytest and should be run standalone to avoid process group cleanup issues.
+
 ## Dataset alignment test
 
 `tests/test_dataset_modalities.py::test_real_dataset_alignment` automatically skips if the COCO validation set defined in `DEFAULT_DATA_REGISTRY` is not present. To exercise it fully, download the dataset referenced in the registry before running `pytest -m cpu_only`.
@@ -103,3 +123,4 @@ Verifies hybrid parallelism combining DeepSpeed Sequence Parallel with Data Para
 | `test_text_autotp_dp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_dp.py -v` |
 | `test_vision_sp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_sp.py -v` |
 | `test_vision_sp_dp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=4 -m pytest tests/test_vision_sp_dp.py -v` |
+| `test_text_autotp_layer.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_layer.py -v -s` |

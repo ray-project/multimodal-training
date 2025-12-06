@@ -16,7 +16,13 @@ import logging
 import os
 
 import torch
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModelForCausalLM
+
+# Qwen2.5-VL is not yet wired into AutoModelForCausalLM, so import explicitly
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except ImportError:  # pragma: no cover - handled at runtime
+    Qwen2_5_VLForConditionalGeneration = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,13 +49,23 @@ def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool =
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     logger.info(f"Model config loaded: {config.model_type}")
 
-    # Load the full model with all weights
+    # Load the full causal LM model so the lm_head weights are included
     logger.info("Loading full model (this may take a while)...")
-    model = AutoModel.from_pretrained(
-        model_name,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=torch.bfloat16,  # Use bfloat16 to save memory
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch.bfloat16,  # Use bfloat16 to save memory
+        )
+    except ValueError:
+        if Qwen2_5_VLForConditionalGeneration is None:
+            raise
+        logger.info("Falling back to Qwen2_5_VLForConditionalGeneration for loading.")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch.bfloat16,
+        )
 
     logger.info("Model loaded successfully")
 
@@ -62,9 +78,12 @@ def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool =
     text_state_dict = {}
 
     for key, value in state_dict.items():
-        if key.startswith("visual."):
-            # Vision model weights - remove "visual." prefix
-            new_key = key[len("visual.") :]
+        if key.startswith("visual.") or key.startswith("model.visual."):
+            # Vision model weights - remove the visual prefix (with or without model.)
+            if key.startswith("model.visual."):
+                new_key = key[len("model.visual.") :]
+            else:
+                new_key = key[len("visual.") :]
             vision_state_dict[new_key] = value
         else:
             # Text model weights - remove common prefixes for cleaner keys

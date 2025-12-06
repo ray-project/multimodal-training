@@ -140,8 +140,10 @@ class BaseTextTrainer(Trainer):
             text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
             # Temporarily assign model for loading
             self.model = model
+            self.lm_head = lm_head
             self.load_pretrained_weights(text_checkpoint_path)
             model = self.model
+            lm_head = self.lm_head
 
         # Activation checkpointing
         activation_checkpointing = config["activation_checkpointing"]
@@ -159,7 +161,8 @@ class BaseTextTrainer(Trainer):
         embed_module = self._get_embedding_module(model)
         if embed_module is None:
             raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         model.train()
         lm_head.train()
@@ -215,8 +218,10 @@ class BaseTextTrainer(Trainer):
             text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
             # Temporarily assign model for loading
             self.model = model
+            self.lm_head = lm_head
             self.load_pretrained_weights(text_checkpoint_path)
             model = self.model
+            lm_head = self.lm_head
 
         # Apply activation checkpointing
         activation_checkpointing = config["activation_checkpointing"]
@@ -226,7 +231,8 @@ class BaseTextTrainer(Trainer):
         embed_module = self._get_embedding_module(model)
         if embed_module is None:
             raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         # Attach lm_head to model so DeepSpeed can manage both
         model.lm_head = lm_head
@@ -290,8 +296,10 @@ class BaseTextTrainer(Trainer):
             text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
             # Temporarily assign model for loading
             self.model = model
+            self.lm_head = lm_head
             self.load_pretrained_weights(text_checkpoint_path)
             model = self.model
+            lm_head = self.lm_head
 
         # Apply activation checkpointing
         activation_checkpointing = config["activation_checkpointing"]
@@ -301,7 +309,8 @@ class BaseTextTrainer(Trainer):
         embed_module = self._get_embedding_module(model)
         if embed_module is None:
             raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         # Attach lm_head to model so DeepSpeed can manage both
         model.lm_head = lm_head
@@ -507,6 +516,7 @@ class BaseTextTrainer(Trainer):
             # Remove 'language_model.' prefix if present (HuggingFace full model vs text-only component)
             # Also handle 'model.' prefix
             cleaned_state_dict = {}
+            lm_head_state_dict = {}
             for key, value in state_dict.items():
                 new_key = key
                 # Remove 'language_model.' prefix
@@ -515,7 +525,10 @@ class BaseTextTrainer(Trainer):
                 # Remove 'model.' prefix if it's still there
                 elif new_key.startswith("model."):
                     new_key = new_key[len("model.") :]
-                cleaned_state_dict[new_key] = value
+                if new_key.startswith("lm_head."):
+                    lm_head_state_dict[new_key[len("lm_head.") :]] = value
+                else:
+                    cleaned_state_dict[new_key] = value
 
             # Load into model
             if self.use_deepspeed and self.deepspeed_engine is not None:
@@ -530,6 +543,14 @@ class BaseTextTrainer(Trainer):
                 logger.warning(f"[r{self.rank}] Missing keys when loading text weights: {missing_keys[:10]}")
             if unexpected_keys:
                 logger.warning(f"[r{self.rank}] Unexpected keys when loading text weights: {unexpected_keys[:10]}")
+
+            # Load lm_head weights if present
+            if lm_head_state_dict and hasattr(self, "lm_head") and self.lm_head is not None:
+                lm_missing, lm_unexpected = self.lm_head.load_state_dict(lm_head_state_dict, strict=False)
+                if lm_missing:
+                    logger.warning(f"[r{self.rank}] Missing keys for lm_head: {lm_missing[:10]}")
+                if lm_unexpected:
+                    logger.warning(f"[r{self.rank}] Unexpected keys for lm_head: {lm_unexpected[:10]}")
 
             logger.info(
                 f"[r{self.rank}] Successfully loaded pretrained text weights ({len(cleaned_state_dict)} parameters)"

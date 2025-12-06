@@ -180,6 +180,10 @@ def merge_checkpoint(
         full_state_dict[f"visual.{key}"] = value
 
     for key, value in text_state_dict.items():
+        # Keep lm_head weights without extra prefix to match HuggingFace format
+        if key.startswith("lm_head."):
+            full_state_dict[key] = value
+            continue
         # Add language_model. prefix if not already present
         if not key.startswith("language_model.") and not key.startswith("model."):
             full_state_dict[f"language_model.{key}"] = value

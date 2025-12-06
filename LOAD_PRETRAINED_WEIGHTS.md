@@ -16,7 +16,7 @@ The training framework splits VLMs into separate vision and text components that
 
 **Script**: `scripts/split_checkpoint.py`
 
-Loads a HuggingFace Qwen2.5-VL checkpoint and splits it into separate vision and text model weights.
+Loads a HuggingFace Qwen2.5-VL checkpoint and splits it into separate vision and text model weights (including the untied `lm_head`).
 
 **Usage**:
 ```bash
@@ -34,14 +34,14 @@ python scripts/split_checkpoint.py \
 ```
 checkpoints/split/qwen2.5-vl-7b/
 ├── vision_model.pt           # Vision encoder weights
-├── text_model.pt             # Text decoder weights
+├── text_model.pt             # Text decoder weights (plus lm_head)
 ├── config.json               # Full model config
 └── split_metadata.json       # Split metadata
 ```
 
 **Example**:
 ```bash
-# Split Qwen2.5-VL-7B-Instruct
+# Split Qwen2.5-VL-7B-Instruct (regenerates vision, text, and lm_head weights)
 python scripts/split_checkpoint.py \
     --model-name Qwen/Qwen2.5-VL-7B-Instruct \
     --output-dir checkpoints/pretrained/qwen2.5-vl-7b
@@ -51,6 +51,8 @@ python scripts/split_checkpoint.py \
     --model-name Qwen/Qwen2.5-VL-3B-Instruct \
     --output-dir checkpoints/pretrained/qwen2.5-vl-3b
 ```
+
+> **Note:** Existing split checkpoints created before this update are missing the `lm_head` weights. Re-run `scripts/split_checkpoint.py` using the commands above to regenerate the split directory before training.
 
 ### 2. Training from Pretrained Checkpoints
 
@@ -105,7 +107,7 @@ python -m python.train_ray \
 
 The training script will automatically:
 1. Load the vision model weights from `{pretrained_checkpoint_dir}/vision_model.pt`
-2. Load the text model weights from `{pretrained_checkpoint_dir}/text_model.pt`
+2. Load the text model weights **and** untied `lm_head` from `{pretrained_checkpoint_dir}/text_model.pt`
 3. Continue training from these pretrained weights
 
 ### 3. Merge Trained Checkpoints
