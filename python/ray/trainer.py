@@ -622,13 +622,63 @@ class Trainer(RayActor):
             f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
         )
 
+    def _build_deepspeed_optimizer_params(self, model, config):
+        """
+        Build optimizer parameter groups for DeepSpeed with proper weight decay handling.
+
+        Excludes bias, LayerNorm, and RMSNorm parameters from weight decay,
+        matching the behavior of _build_optimizer() for DTensor path.
+
+        Args:
+            model: The model to extract named parameters from
+            config: Training config dict containing weight_decay
+
+        Returns:
+            list: Parameter groups for DeepSpeed optimizer
+        """
+        weight_decay = config["weight_decay"]
+
+        # If no weight decay, return simple param list
+        if weight_decay == 0.0:
+            return None  # Use default behavior
+
+        # Collect named parameters
+        named_params = list(model.named_parameters())
+
+        # Get parameter names that should have decay (excludes bias, norm, etc.)
+        decay_param_names = self._get_decay_parameter_names(named_params)
+
+        # Split into decay and no-decay groups
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+            if name in decay_param_names:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+        rank = getattr(self, "rank", 0)
+        logger.debug(
+            f"[r{rank}] DeepSpeed optimizer groups: {len(decay_params)} params with decay, "
+            f"{len(no_decay_params)} params without decay (weight_decay={weight_decay})"
+        )
+
+        # Return parameter groups in DeepSpeed format
+        return [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
     def _initialize_deepspeed(self, model, params, config, torch_dtype, mpu=None, tensor_parallel_config=None):
         """
         Initialize DeepSpeed engine with the given model and parameters.
 
         Args:
             model: The model to wrap with DeepSpeed
-            params: List of parameters to optimize
+            params: List of parameters to optimize (may be overridden by parameter groups)
             config: Training config dict
             torch_dtype: Target dtype (torch.float16 or torch.bfloat16)
             mpu: Optional model/sequence parallel state module to pass into DeepSpeed
@@ -645,6 +695,12 @@ class Trainer(RayActor):
         learning_rate = config["learning_rate"]
         batch_size = config["batch_size"]
         autocast_enabled = config.get("autocast", True)
+
+        # Build optimizer parameter groups for proper weight decay handling
+        optimizer_params = self._build_deepspeed_optimizer_params(model, config)
+        if optimizer_params is not None:
+            # Use parameter groups instead of flat params
+            params = optimizer_params
 
         # All-reduce happens over the data-parallel group. Track total, DP, and SP sizes separately.
         if dist.is_initialized():
@@ -696,7 +752,6 @@ class Trainer(RayActor):
         reduce_bucket_size = config["reduce_bucket_size"]
 
         # Configure DeepSpeed fp16/bf16/autocast based on dtype and autocast setting
-        # When autocast is enabled, we use torch_autocast and disable fp16/bf16
         # When autocast is disabled, we use DeepSpeed's native fp16/bf16
         use_torch_autocast = autocast_enabled and torch_dtype != torch.float32
 
@@ -724,7 +779,9 @@ class Trainer(RayActor):
                 "type": "Adam",
                 "params": {
                     "lr": learning_rate,
-                    "weight_decay": config["weight_decay"],
+                    # weight_decay is handled per parameter group in model_parameters
+                    # to exclude bias/norm params, matching DTensor behavior
+                    "weight_decay": 0.0,
                 },
             },
             "zero_allow_untested_optimizer": True,
