@@ -156,10 +156,11 @@ class BaseTextTrainer(Trainer):
         lm_head.to(device=device, dtype=torch_dtype)
 
         # Tie weights between lm_head and embeddings
-        embed_module = self._get_embedding_module(model)
-        if embed_module is None:
-            raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            embed_module = self._get_embedding_module(model)
+            if embed_module is None:
+                raise ValueError("Unable to locate embedding module for tying the LM head.")
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         model.train()
         lm_head.train()
@@ -223,10 +224,11 @@ class BaseTextTrainer(Trainer):
         self._apply_activation_checkpointing(model, activation_checkpointing, "text model")
 
         # Tie weights between lm_head and embeddings
-        embed_module = self._get_embedding_module(model)
-        if embed_module is None:
-            raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            embed_module = self._get_embedding_module(model)
+            if embed_module is None:
+                raise ValueError("Unable to locate embedding module for tying the LM head.")
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         # Attach lm_head to model so DeepSpeed can manage both
         model.lm_head = lm_head
@@ -298,10 +300,11 @@ class BaseTextTrainer(Trainer):
         self._apply_activation_checkpointing(model, activation_checkpointing, "text model")
 
         # Tie weights between lm_head and embeddings
-        embed_module = self._get_embedding_module(model)
-        if embed_module is None:
-            raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            embed_module = self._get_embedding_module(model)
+            if embed_module is None:
+                raise ValueError("Unable to locate embedding module for tying the LM head.")
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         # Attach lm_head to model so DeepSpeed can manage both
         model.lm_head = lm_head
