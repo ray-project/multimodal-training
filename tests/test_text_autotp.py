@@ -263,6 +263,323 @@ def sync_model_weights(src_model, src_lm_head, dst_model, dst_lm_head):
         dst_lm_head.weight.copy_(src_lm_head.weight)
 
 
+def run_baseline_training(
+    model_config,
+    device,
+    torch_dtype,
+    vocab_size,
+    batch_size,
+    seq_len,
+    num_steps,
+    seed=42,
+    collect_params=False,
+    collect_logits=False,
+    rank=0,
+):
+    """Run baseline (no-parallel) training and return losses.
+
+    Args:
+        model_config: Model configuration
+        device: Device to run on
+        torch_dtype: Data type for model
+        vocab_size: Vocabulary size
+        batch_size: Batch size
+        seq_len: Sequence length
+        num_steps: Number of training steps
+        seed: Random seed for initialization
+        collect_params: Whether to collect parameter snapshots after each step
+        collect_logits: Whether to collect logits at each step (before backward)
+        rank: Current rank (for logging)
+
+    Returns:
+        Tuple of (losses, params, logits_list) where params/logits_list are empty lists if not collected
+    """
+    print(f"\n[Rank {rank}] " + "=" * 60)
+    print(f"[Rank {rank}] Creating NO-PARALLEL baseline model")
+    print(f"[Rank {rank}] " + "=" * 60)
+
+    baseline_model, baseline_lm_head = create_no_parallel_model(model_config, device, torch_dtype, seed=seed)
+
+    # Create optimizer
+    params = list(baseline_model.parameters()) + list(baseline_lm_head.parameters())
+    # Deduplicate tied weights
+    param_ids = set()
+    unique_params = []
+    for p in params:
+        if id(p) not in param_ids:
+            param_ids.add(id(p))
+            unique_params.append(p)
+    optimizer = torch.optim.AdamW(unique_params, lr=1e-4, weight_decay=0.01)
+
+    # Training loop for baseline
+    baseline_losses = []
+    baseline_params = []
+    baseline_logits = []
+
+    for step in range(num_steps):
+        # Use same seed for deterministic data generation
+        input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=seed + step)
+
+        optimizer.zero_grad()
+
+        # Forward pass - compute logits explicitly
+        outputs = baseline_model(input_ids=input_ids)
+        logits = baseline_lm_head(outputs.last_hidden_state)
+
+        # Collect logits before backward (detach to avoid memory issues)
+        if collect_logits:
+            baseline_logits.append(logits.detach().clone())
+
+        # Compute loss
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        baseline_losses.append(loss.item())
+        loss.backward()
+
+        # Optimizer step
+        optimizer.step()
+
+        # Collect selected parameters after optimizer step
+        if collect_params:
+            params_snapshot = collect_selected_parameters(baseline_model)
+            baseline_params.append(params_snapshot)
+
+        print(f"[Rank {rank}] Baseline step {step}: loss={loss.item():.6f}")
+
+    print(f"[Rank {rank}] Baseline training complete")
+
+    return baseline_losses, baseline_params, baseline_logits
+
+
+def run_autotp_training(
+    model_config,
+    rank,
+    world_size,
+    device,
+    torch_dtype,
+    vocab_size,
+    batch_size,
+    seq_len,
+    num_steps,
+    seed=42,
+    collect_params=False,
+    collect_logits=False,
+    vocab_parallel=False,
+):
+    """Run AutoTP training and return losses.
+
+    Args:
+        model_config: Model configuration
+        rank: Current rank
+        world_size: Total number of ranks
+        device: Device to run on
+        torch_dtype: Data type for model
+        vocab_size: Vocabulary size
+        batch_size: Batch size
+        seq_len: Sequence length
+        num_steps: Number of training steps
+        seed: Random seed for initialization
+        collect_params: Whether to collect parameter snapshots after each step
+        collect_logits: Whether to collect logits at each step (gathered full logits)
+        vocab_parallel: Whether to use VocabParallelEmbedding and vocab_parallel_causal_cross_entropy
+
+    Returns:
+        Tuple of (losses, params, logits_list) where params/logits_list are empty lists if not collected
+    """
+    autotp_size = world_size  # Pure TP: all ranks in same TP group
+
+    print(f"\n[Rank {rank}] " + "=" * 60)
+    if vocab_parallel:
+        print(f"[Rank {rank}] Creating AutoTP model with VocabParallelEmbedding (autotp_size={autotp_size})")
+    else:
+        print(f"[Rank {rank}] Creating AutoTP model (autotp_size={autotp_size})")
+    print(f"[Rank {rank}] " + "=" * 60)
+
+    # Create config
+    config = {
+        "model_name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "parallelism": "autotp",
+        "dtype": "bfloat16",
+        "attention_backend": "sdpa",
+        "activation_checkpointing": False,
+        "autocast": True,
+        "zero_stage": 1,
+        "learning_rate": 1e-4,
+        "weight_decay": 0.01,
+        "batch_size": 1,
+        "num_iterations": 5,
+        "warmup_steps": 0,
+        "warmup_ratio": 0.0,
+        "lr_scheduler_type": "constant",
+        "gradient_accumulation_steps": 1,
+        "reduce_bucket_size": 500000000,
+        "seed": seed,
+        "clip_grad_norm": False,
+        "max_grad_norm": 1.0,
+        "autotp_size": autotp_size,
+        "tp_overlap_comm": False,
+        "train_batch_size_override": None,
+        "use_vocab_parallel": vocab_parallel,
+    }
+
+    trainer = AutoTPQwenTextTrainer(config, rank)
+
+    # Build model using AutoTP
+    from deepspeed.module_inject.layers import set_autotp_mode
+    set_autotp_mode(training=True)
+
+    # Set seed for deterministic initialization
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.set_default_device(device)
+    model = Qwen2_5_VLTextModel._from_config(model_config.text_config)
+    lm_head = nn.Linear(model_config.text_config.hidden_size, model_config.text_config.vocab_size, bias=False)
+    torch.set_default_device("cpu")
+
+    model.to(torch_dtype)
+    lm_head.to(torch_dtype)
+
+    # Tie weights
+    lm_head.weight = model.embed_tokens.weight
+    model.lm_head = lm_head
+
+    # Disable dropout for deterministic behavior
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = 0.0
+
+    # Collect parameters
+    params = trainer._collect_parameters_from_modules(model, lm_head)
+
+    from deepspeed.utils import groups
+    tensor_parallel_cfg = {"autotp_size": autotp_size}
+
+    # Initialize DeepSpeed with AutoTP
+    model_engine, optimizer, _, _ = trainer._initialize_deepspeed(
+        model=model,
+        params=params,
+        config=config,
+        torch_dtype=torch_dtype,
+        tensor_parallel_config=tensor_parallel_cfg,
+    )
+
+    try:
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        tp_world_size = groups.get_tensor_model_parallel_world_size()
+    except Exception:
+        tp_group = None
+        tp_rank = 0
+        tp_world_size = 1
+
+    # Apply VocabParallelEmbedding if requested
+    if vocab_parallel and tp_group is not None:
+        from python.tensor_parallel import VocabParallelEmbedding
+
+        original_embedding = model_engine.module.embed_tokens
+        print(f"[Rank {rank}] Original embedding shape: {original_embedding.weight.shape}")
+
+        vocab_parallel_embedding = VocabParallelEmbedding(
+            num_embeddings=original_embedding.num_embeddings,
+            embedding_dim=original_embedding.embedding_dim,
+            padding_idx=original_embedding.padding_idx,
+            tp_group=tp_group,
+            dtype=original_embedding.weight.dtype,
+            device=device,
+        )
+
+        with torch.no_grad():
+            start_idx = vocab_parallel_embedding.vocab_start_index
+            end_idx = vocab_parallel_embedding.vocab_end_index
+            vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
+
+        model_engine.module.embed_tokens = vocab_parallel_embedding
+        model_engine.module.lm_head.weight = vocab_parallel_embedding.weight
+
+        print(f"[Rank {rank}] VocabParallelEmbedding: vocab_range=[{start_idx}, {end_idx}), "
+              f"partition_size={end_idx - start_idx}")
+
+    trainer.model = model_engine
+    trainer.model_config = model_config
+    trainer.lm_head = model_engine.module.lm_head
+    trainer.model.tp_group = tp_group
+    trainer.deepspeed_engine = model_engine
+
+    dist.barrier()
+    print(f"[Rank {rank}] AutoTP model created with same initialization seed as baseline")
+
+    # Import vocab parallel loss if needed
+    if vocab_parallel:
+        from python.tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
+
+    # Training loop
+    autotp_losses = []
+    autotp_params = []
+    autotp_logits = []
+
+    for step in range(num_steps):
+        input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=seed + step)
+        broadcast_for_tensor_parallel([input_ids, labels], tp_group)
+
+        trainer.zero_grad()
+
+        # Forward pass
+        with trainer._get_autocast_context():
+            outputs = trainer.model(input_ids=input_ids)
+            logits = trainer.lm_head(outputs.last_hidden_state)
+
+        # Collect logits (gather full logits if vocab parallel)
+        if collect_logits:
+            if vocab_parallel and tp_group is not None:
+                # Each rank has logits of shape [batch, seq, vocab_per_rank]
+                # Gather to get full [batch, seq, vocab_size]
+                logits_list = [torch.zeros_like(logits) for _ in range(tp_world_size)]
+                dist.all_gather(logits_list, logits.contiguous(), group=tp_group)
+                full_logits = torch.cat(logits_list, dim=-1)
+                autotp_logits.append(full_logits.detach().clone())
+            else:
+                autotp_logits.append(logits.detach().clone())
+
+        # Compute loss
+        if vocab_parallel and tp_group is not None:
+            loss = vocab_parallel_causal_cross_entropy(
+                logits,
+                labels,
+                tp_group,
+                tp_rank,
+                tp_world_size,
+                ignore_index=-100,
+            )
+        else:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        autotp_losses.append(loss.item())
+
+        # Backward
+        trainer.deepspeed_engine.backward(loss)
+
+        # Optimizer step
+        trainer.optimizer_step()
+
+        # Collect parameters after optimizer step
+        if collect_params:
+            params_snapshot = collect_selected_parameters(trainer.deepspeed_engine.module)
+            autotp_params.append(params_snapshot)
+
+        print(f"[Rank {rank}] AutoTP step {step}: loss={loss.item():.6f}")
+
+    print(f"[Rank {rank}] AutoTP training complete")
+
+    return autotp_losses, autotp_params, autotp_logits
+
+
 def test_autotp_vs_no_parallel():
     """Test that AutoTP produces the same losses and parameters as no-parallel baseline.
 
@@ -291,51 +608,23 @@ def test_autotp_vs_no_parallel():
     # ========================================
     # BASELINE: No-parallel model (rank 0 only)
     # ========================================
-    baseline_model = None
-    baseline_lm_head = None
     baseline_losses = []
     baseline_params = []
 
     if rank == 0:
-        print(f"\n[Rank {rank}] " + "=" * 60)
-        print(f"[Rank {rank}] Creating NO-PARALLEL baseline model")
-        print(f"[Rank {rank}] " + "=" * 60)
-
-        baseline_model, baseline_lm_head = create_no_parallel_model(model_config, device, torch_dtype)
-
-        # Create optimizer
-        params = list(baseline_model.parameters()) + list(baseline_lm_head.parameters())
-        # Deduplicate tied weights
-        param_ids = set()
-        unique_params = []
-        for p in params:
-            if id(p) not in param_ids:
-                param_ids.add(id(p))
-                unique_params.append(p)
-        optimizer = torch.optim.AdamW(unique_params, lr=1e-4, weight_decay=0.01)
-
-        # Training loop for baseline
-        for step in range(num_steps):
-            # Use same seed for deterministic data generation
-            input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=42 + step)
-
-            optimizer.zero_grad()
-
-            # Forward and backward
-            loss = compute_loss(baseline_model, baseline_lm_head, input_ids, labels)
-            baseline_losses.append(loss.item())
-            loss.backward()
-
-            # Optimizer step
-            optimizer.step()
-
-            # Collect selected parameters after optimizer step
-            params_snapshot = collect_selected_parameters(baseline_model)
-            baseline_params.append(params_snapshot)
-
-            print(f"[Rank {rank}] Baseline step {step}: loss={loss.item():.6f}")
-
-        print(f"[Rank {rank}] Baseline training complete")
+        baseline_losses, baseline_params, _ = run_baseline_training(
+            model_config=model_config,
+            device=device,
+            torch_dtype=torch_dtype,
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_steps=num_steps,
+            seed=42,
+            collect_params=True,
+            collect_logits=False,
+            rank=rank,
+        )
 
     # Sync before starting AutoTP test
     dist.barrier()
@@ -343,55 +632,21 @@ def test_autotp_vs_no_parallel():
     # ========================================
     # AutoTP model (all ranks)
     # ========================================
-    print(f"\n[Rank {rank}] " + "=" * 60)
-    print(f"[Rank {rank}] Creating AutoTP model (autotp_size={autotp_size})")
-    print(f"[Rank {rank}] " + "=" * 60)
-
-    # Create AutoTP trainer with same seed as baseline for identical initialization
-    autotp_trainer = create_autotp_trainer(model_config, rank, autotp_size, device, torch_dtype, seed=42)
-    tp_group = autotp_trainer.model.tp_group
-
-    dist.barrier()
-    print(f"[Rank {rank}] AutoTP model created with same initialization seed as baseline")
-
-    # Training loop for AutoTP
-    autotp_losses = []
-    autotp_params = []
-
-    for step in range(num_steps):
-        # Use same seed for deterministic data generation (all ranks generate same data)
-        input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=42 + step)
-
-        # Broadcast data to ensure all TP ranks see the same input
-        broadcast_for_tensor_parallel([input_ids, labels], tp_group)
-
-        autotp_trainer.zero_grad()
-
-        # Forward and backward
-        with autotp_trainer._get_autocast_context():
-            outputs = autotp_trainer.model(input_ids=input_ids)
-            logits = autotp_trainer.lm_head(outputs.last_hidden_state)
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        autotp_losses.append(loss.item())
-
-        # Backward
-        autotp_trainer.deepspeed_engine.backward(loss)
-
-        # Optimizer step
-        autotp_trainer.optimizer_step()
-
-        # Collect selected parameters after optimizer step
-        params_snapshot = collect_selected_parameters(autotp_trainer.deepspeed_engine.module)
-        autotp_params.append(params_snapshot)
-
-        print(f"[Rank {rank}] AutoTP step {step}: loss={loss.item():.6f}")
-
-    print(f"[Rank {rank}] AutoTP training complete")
+    autotp_losses, autotp_params, _ = run_autotp_training(
+        model_config=model_config,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        torch_dtype=torch_dtype,
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_steps=num_steps,
+        seed=42,
+        collect_params=True,
+        collect_logits=False,
+        vocab_parallel=False,
+    )
 
     # ========================================
     # Compare losses and parameters (rank 0 only)
@@ -523,194 +778,42 @@ def test_autotp_vocab_parallel():
     baseline_losses = []
 
     if rank == 0:
-        print(f"\n[Rank {rank}] " + "=" * 60)
-        print(f"[Rank {rank}] Creating NO-PARALLEL baseline model")
-        print(f"[Rank {rank}] " + "=" * 60)
-
-        baseline_model, baseline_lm_head = create_no_parallel_model(model_config, device, torch_dtype)
-
-        # Create optimizer
-        params = list(baseline_model.parameters()) + list(baseline_lm_head.parameters())
-        param_ids = set()
-        unique_params = []
-        for p in params:
-            if id(p) not in param_ids:
-                param_ids.add(id(p))
-                unique_params.append(p)
-        optimizer = torch.optim.AdamW(unique_params, lr=1e-4, weight_decay=0.01)
-
-        # Training loop for baseline
-        for step in range(num_steps):
-            input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=42 + step)
-
-            optimizer.zero_grad()
-            loss = compute_loss(baseline_model, baseline_lm_head, input_ids, labels)
-            baseline_losses.append(loss.item())
-            loss.backward()
-            optimizer.step()
-
-            print(f"[Rank {rank}] Baseline step {step}: loss={loss.item():.6f}")
-
-        print(f"[Rank {rank}] Baseline training complete")
+        baseline_losses, _, baseline_logits = run_baseline_training(
+            model_config=model_config,
+            device=device,
+            torch_dtype=torch_dtype,
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_steps=num_steps,
+            seed=42,
+            collect_params=False,
+            collect_logits=True,
+            rank=rank,
+        )
+    else:
+        baseline_logits = []
 
     dist.barrier()
 
     # ========================================
     # AutoTP model with vocab parallel (all ranks)
     # ========================================
-    print(f"\n[Rank {rank}] " + "=" * 60)
-    print(f"[Rank {rank}] Creating AutoTP model with VocabParallelEmbedding (autotp_size={autotp_size})")
-    print(f"[Rank {rank}] " + "=" * 60)
-
-    # Create config with use_vocab_parallel=True
-    config = {
-        "model_name": "Qwen/Qwen2.5-VL-3B-Instruct",
-        "parallelism": "autotp",
-        "dtype": "bfloat16",
-        "attention_backend": "sdpa",
-        "activation_checkpointing": False,
-        "autocast": True,
-        "zero_stage": 1,
-        "learning_rate": 1e-4,
-        "weight_decay": 0.01,
-        "batch_size": 1,
-        "num_iterations": 5,
-        "warmup_steps": 0,
-        "warmup_ratio": 0.0,
-        "lr_scheduler_type": "constant",
-        "gradient_accumulation_steps": 1,
-        "reduce_bucket_size": 500000000,
-        "seed": 42,
-        "clip_grad_norm": False,
-        "max_grad_norm": 1.0,
-        "autotp_size": autotp_size,
-        "tp_overlap_comm": False,
-        "train_batch_size_override": None,
-        "use_vocab_parallel": True,  # Enable vocab parallel embedding and loss
-    }
-
-    trainer = AutoTPQwenTextTrainer(config, rank)
-
-    from deepspeed.module_inject.layers import set_autotp_mode
-    set_autotp_mode(training=True)
-
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    torch.set_default_device(device)
-    model = Qwen2_5_VLTextModel._from_config(model_config.text_config)
-    lm_head = nn.Linear(model_config.text_config.hidden_size, model_config.text_config.vocab_size, bias=False)
-    torch.set_default_device("cpu")
-
-    model.to(torch_dtype)
-    lm_head.to(torch_dtype)
-
-    # Tie weights
-    lm_head.weight = model.embed_tokens.weight
-    model.lm_head = lm_head
-
-    # Disable dropout for deterministic behavior
-    for module in model.modules():
-        if isinstance(module, nn.Dropout):
-            module.p = 0.0
-
-    # Collect parameters
-    params = trainer._collect_parameters_from_modules(model, lm_head)
-
-    from deepspeed.utils import groups
-    tensor_parallel_cfg = {"autotp_size": autotp_size}
-
-    # Initialize DeepSpeed with AutoTP
-    model_engine, optimizer, _, _ = trainer._initialize_deepspeed(
-        model=model,
-        params=params,
-        config=config,
+    autotp_losses, _, autotp_logits = run_autotp_training(
+        model_config=model_config,
+        rank=rank,
+        world_size=world_size,
+        device=device,
         torch_dtype=torch_dtype,
-        tensor_parallel_config=tensor_parallel_cfg,
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_steps=num_steps,
+        seed=42,
+        collect_params=False,
+        collect_logits=True,
+        vocab_parallel=True,
     )
-
-    try:
-        tp_group = groups.get_tensor_model_parallel_group()
-        tp_rank = groups.get_tensor_model_parallel_rank()
-        tp_world_size = groups.get_tensor_model_parallel_world_size()
-    except Exception:
-        tp_group = None
-        tp_rank = 0
-        tp_world_size = 1
-
-    # Apply VocabParallelEmbedding manually (simulating what _build_model_with_autotp does)
-    from python.tensor_parallel import VocabParallelEmbedding
-    from python.tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
-
-    if tp_group is not None:
-        original_embedding = model_engine.module.embed_tokens
-        print(f"[Rank {rank}] Original embedding shape: {original_embedding.weight.shape}")
-
-        vocab_parallel_embedding = VocabParallelEmbedding(
-            num_embeddings=original_embedding.num_embeddings,
-            embedding_dim=original_embedding.embedding_dim,
-            padding_idx=original_embedding.padding_idx,
-            tp_group=tp_group,
-            dtype=original_embedding.weight.dtype,
-            device=device,
-        )
-
-        with torch.no_grad():
-            start_idx = vocab_parallel_embedding.vocab_start_index
-            end_idx = vocab_parallel_embedding.vocab_end_index
-            vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
-
-        model_engine.module.embed_tokens = vocab_parallel_embedding
-        model_engine.module.lm_head.weight = vocab_parallel_embedding.weight
-
-        print(f"[Rank {rank}] VocabParallelEmbedding: vocab_range=[{start_idx}, {end_idx}), "
-              f"partition_size={end_idx - start_idx}")
-
-    trainer.model = model_engine
-    trainer.model_config = model_config
-    trainer.lm_head = model_engine.module.lm_head
-    trainer.model.tp_group = tp_group
-    trainer.deepspeed_engine = model_engine
-
-    dist.barrier()
-
-    # Training loop for AutoTP with vocab parallel
-    autotp_losses = []
-
-    for step in range(num_steps):
-        input_ids, labels = prepare_batch(vocab_size, batch_size, seq_len, device, seed=42 + step)
-        broadcast_for_tensor_parallel([input_ids, labels], tp_group)
-
-        trainer.zero_grad()
-
-        with trainer._get_autocast_context():
-            outputs = trainer.model(input_ids=input_ids)
-            logits = trainer.lm_head(outputs.last_hidden_state)
-
-        # Use vocab_parallel_causal_cross_entropy
-        if tp_group is not None:
-            loss = vocab_parallel_causal_cross_entropy(
-                logits,
-                labels,
-                tp_group,
-                tp_rank,
-                tp_world_size,
-                ignore_index=-100,
-            )
-        else:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        autotp_losses.append(loss.item())
-
-        trainer.deepspeed_engine.backward(loss)
-        trainer.optimizer_step()
-
-        print(f"[Rank {rank}] AutoTP Vocab Parallel step {step}: loss={loss.item():.6f}")
-
-    print(f"[Rank {rank}] AutoTP Vocab Parallel training complete")
 
     # ========================================
     # Compare losses (rank 0 only)
@@ -722,8 +825,35 @@ def test_autotp_vocab_parallel():
         print(f"[Rank {rank}] COMPARISON: Baseline vs AutoTP Vocab Parallel")
         print(f"[Rank {rank}] " + "=" * 60)
 
+        # Compare logits first to identify if model forward pass is correct
+        print(f"\n[Rank {rank}] Logits Comparison:")
+        logits_match = True
+        LOGITS_TOLERANCE = 1e-4
+        for step in range(num_steps):
+            baseline_logit = baseline_logits[step]
+            autotp_logit = autotp_logits[step]
+
+            if baseline_logit.shape != autotp_logit.shape:
+                print(f"[Rank {rank}] Step {step}: ❌ Logits shape mismatch! "
+                      f"baseline={baseline_logit.shape}, autotp={autotp_logit.shape}")
+                logits_match = False
+                continue
+
+            # Compare logits
+            logit_diff = (baseline_logit.float() - autotp_logit.float()).abs()
+            max_diff = logit_diff.max().item()
+            mean_diff = logit_diff.mean().item()
+            rel_diff = (logit_diff / (baseline_logit.float().abs() + 1e-8)).mean().item()
+
+            if max_diff < LOGITS_TOLERANCE:
+                print(f"[Rank {rank}] Step {step}: ✅ Logits match! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+            else:
+                print(f"[Rank {rank}] Step {step}: ❌ Logits differ! max_diff={max_diff:.6e}, "
+                      f"mean_diff={mean_diff:.6e}, rel_diff={rel_diff:.6e}")
+                logits_match = False
+
         print(f"\n[Rank {rank}] Loss Comparison:")
-        all_match = True
+        loss_match = True
         for step in range(num_steps):
             baseline_loss = baseline_losses[step]
             autotp_loss = autotp_losses[step]
@@ -733,22 +863,24 @@ def test_autotp_vocab_parallel():
             print(f"[Rank {rank}] Step {step}: baseline_loss={baseline_loss:.6f}, autotp_vocab_loss={autotp_loss:.6f}, "
                   f"diff={loss_diff:.6e}, rel_diff={rel_diff:.6e}")
 
-            # Use a more relaxed tolerance for integration test since:
-            # - Baseline uses simple AdamW, AutoTP uses DeepSpeed ZeRO-1
-            # - AutoTP partitions transformer layers differently
-            # - Different computation patterns lead to numerical differences
-            LOSS_TOLERANCE = 0.1  # 10% relative tolerance for integration test
-            if rel_diff < LOSS_TOLERANCE:
+            LOSS_TOLERANCE = 1e-4
+            if loss_diff < LOSS_TOLERANCE:
                 print(f"[Rank {rank}] Step {step}: ✅ Losses are reasonably close!")
             else:
                 print(f"[Rank {rank}] Step {step}: ❌ Losses differ significantly!")
-                all_match = False
+                loss_match = False
 
+        # Summary
         print(f"\n[Rank {rank}] ====================================================================")
-        if all_match:
+        print(f"[Rank {rank}] SUMMARY:")
+        print(f"[Rank {rank}]   Logits match: {'✅ YES' if logits_match else '❌ NO'}")
+        print(f"[Rank {rank}]   Losses match: {'✅ YES' if loss_match else '❌ NO'}")
+        if logits_match and not loss_match:
+            print(f"[Rank {rank}]   => Issue is in LOSS CALCULATION (vocab_parallel_causal_cross_entropy)")
+        elif not logits_match and not loss_match:
+            print(f"[Rank {rank}]   => Issue is in MODEL FORWARD PASS (logits differ)")
+        elif logits_match and loss_match:
             print(f"[Rank {rank}] TEST RESULT: ✅ PASSED - AutoTP with VocabParallelEmbedding working correctly!")
-        else:
-            print(f"[Rank {rank}] TEST RESULT: ❌ FAILED - Losses differ more than expected!")
         print(f"[Rank {rank}] ====================================================================")
 
     dist.barrier()
