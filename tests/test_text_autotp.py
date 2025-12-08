@@ -221,7 +221,7 @@ def compute_loss(model, lm_head, input_ids, labels, autocast_context=None):
         outputs = model(input_ids=input_ids)
         logits = lm_head(outputs.last_hidden_state)
 
-    shift_logits = logits[:, :-1, :].contiguous()
+    shift_logits = logits[:, :-1, :].contiguous().float()
     shift_labels = labels[:, 1:].contiguous()
 
     loss_fct = nn.CrossEntropyLoss()
@@ -331,7 +331,7 @@ def run_baseline_training(
             baseline_logits.append(logits.detach().clone())
 
         # Compute loss
-        shift_logits = logits[:, :-1, :].contiguous()
+        shift_logits = logits[:, :-1, :].contiguous().float()
         shift_labels = labels[:, 1:].contiguous()
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -555,7 +555,7 @@ def run_autotp_training(
                 ignore_index=-100,
             )
         else:
-            shift_logits = logits[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous().float()
             shift_labels = labels[:, 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
