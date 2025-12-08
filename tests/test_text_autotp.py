@@ -74,8 +74,7 @@ def create_no_parallel_model(model_config, device, torch_dtype, seed=42):
     model.to(device=device, dtype=torch_dtype)
     lm_head.to(device=device, dtype=torch_dtype)
 
-    # Tie weights
-    lm_head.weight = model.embed_tokens.weight
+    # Note: Weights are NOT tied (lm_head has its own independent weights)
 
     model.train()
     lm_head.train()
@@ -134,8 +133,7 @@ def create_autotp_trainer(model_config, rank, autotp_size, device, torch_dtype, 
     model.to(torch_dtype)
     lm_head.to(torch_dtype)
 
-    # Tie weights
-    lm_head.weight = model.embed_tokens.weight
+    # Note: Weights are NOT tied (lm_head has its own independent weights)
 
     # Attach lm_head to model for DeepSpeed
     model.lm_head = lm_head
@@ -443,8 +441,7 @@ def run_autotp_training(
     model.to(torch_dtype)
     lm_head.to(torch_dtype)
 
-    # Tie weights
-    lm_head.weight = model.embed_tokens.weight
+    # Note: Weights are NOT tied (lm_head has its own independent weights)
     model.lm_head = lm_head
 
     # Disable dropout for deterministic behavior
@@ -481,7 +478,9 @@ def run_autotp_training(
         from python.tensor_parallel import VocabParallelEmbedding
 
         original_embedding = model_engine.module.embed_tokens
+        original_lm_head = model_engine.module.lm_head
         print(f"[Rank {rank}] Original embedding shape: {original_embedding.weight.shape}")
+        print(f"[Rank {rank}] Original lm_head shape: {original_lm_head.weight.shape}")
 
         vocab_parallel_embedding = VocabParallelEmbedding(
             num_embeddings=original_embedding.num_embeddings,
@@ -492,16 +491,35 @@ def run_autotp_training(
             device=device,
         )
 
+        # Compute vocab partition indices
+        vocab_size = original_embedding.num_embeddings
+        vocab_per_rank = vocab_size // tp_world_size
+        start_idx = tp_rank * vocab_per_rank
+        end_idx = start_idx + vocab_per_rank
+
+        # Copy partitioned embedding weights
         with torch.no_grad():
-            start_idx = vocab_parallel_embedding.vocab_start_index
-            end_idx = vocab_parallel_embedding.vocab_end_index
             vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
 
         model_engine.module.embed_tokens = vocab_parallel_embedding
-        model_engine.module.lm_head.weight = vocab_parallel_embedding.weight
+
+        # Create partitioned lm_head (NOT tied to embedding)
+        # lm_head has shape [vocab_size, hidden_size], we partition on vocab dimension
+        partitioned_lm_head = nn.Linear(
+            original_lm_head.in_features,
+            vocab_per_rank,
+            bias=False,
+            device=device,
+            dtype=original_lm_head.weight.dtype,
+        )
+        with torch.no_grad():
+            partitioned_lm_head.weight.data.copy_(original_lm_head.weight.data[start_idx:end_idx])
+
+        model_engine.module.lm_head = partitioned_lm_head
 
         print(f"[Rank {rank}] VocabParallelEmbedding: vocab_range=[{start_idx}, {end_idx}), "
               f"partition_size={end_idx - start_idx}")
+        print(f"[Rank {rank}] Partitioned lm_head shape: {partitioned_lm_head.weight.shape} (NOT tied to embedding)")
 
     trainer.model = model_engine
     trainer.model_config = model_config
