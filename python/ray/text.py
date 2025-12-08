@@ -393,10 +393,19 @@ class BaseTextTrainer(Trainer):
                 # Replace the embedding in the model
                 self._replace_embedding_module(model, vocab_parallel_embedding)
 
-                # Update lm_head to use the partitioned embedding weights (tied weights)
-                # The lm_head output dimension should now match the partitioned vocab size
+                # Handle lm_head based on weight tying configuration
                 lm_head = model.lm_head
-                lm_head.weight = vocab_parallel_embedding.weight
+                if getattr(model.config, "tie_word_embeddings", True):
+                    # Tied weights: lm_head shares weight with embedding
+                    lm_head.weight = vocab_parallel_embedding.weight
+                    logger.debug(f"[r{self.rank}] lm_head weight tied to VocabParallelEmbedding")
+                else:
+                    # Untied weights: lm_head needs its own partitioned weight
+                    original_lm_head_weight = lm_head.weight.data.clone()
+                    lm_head.weight = nn.Parameter(
+                        original_lm_head_weight[start_idx:end_idx, :].to(device)
+                    )
+                    logger.debug(f"[r{self.rank}] lm_head weight sharded independently (untied)")
 
                 logger.debug(
                     f"[r{self.rank}] VocabParallelEmbedding applied: vocab_range=[{start_idx}, {end_idx}), "
@@ -483,8 +492,16 @@ class BaseTextTrainer(Trainer):
         for layer in layers:
             parallelize_module(layer, tp_mesh, tp_mapping, src_data_rank=0)
 
-        # NOTE: Do NOT parallelize lm_head here because its weights will be
-        # tied to the VocabParallelEmbedding, which already has the correct sharding
+        # Handle lm_head sharding based on weight tying configuration
+        # If weights are tied, lm_head.weight will be set to VocabParallelEmbedding.weight later
+        # If weights are NOT tied, we must manually shard lm_head for correct vocab-parallel loss
+        if not getattr(model.config, "tie_word_embeddings", True):
+            logger.debug(f"[r{self.rank}] Sharding lm_head for untied embeddings (vocab_range=[{start_idx}, {end_idx}))")
+            with torch.no_grad():
+                original_lm_head_weight = lm_head.weight.data.clone()
+                lm_head.weight = nn.Parameter(
+                    original_lm_head_weight[start_idx:end_idx, :].to(device)
+                )
 
         return tp_mesh.get_group()
 
@@ -887,32 +904,32 @@ class BaseTextTrainer(Trainer):
             # Get logits from lm_head
             logits = self.lm_head(text_outputs.last_hidden_state)
 
-        logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
+            logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
 
-        # Compute loss for next-token prediction
-        # Use vocab_parallel_causal_cross_entropy for tensor parallelism (DTensor) or AutoTP with vocab_parallel
-        parallelism = self.config.get("parallelism")
-        tp_group = getattr(self.model, "tp_group", None)
-        use_tp_loss = tp_group is not None and (
-            parallelism == "tensor" or (parallelism == "autotp" and self.config.get("use_vocab_parallel", True))
-        )
-        if use_tp_loss:
-            import torch.distributed as dist
-
-            tp_rank = dist.get_rank(self.model.tp_group)
-            tp_world_size = dist.get_world_size(self.model.tp_group)
-            loss = vocab_parallel_causal_cross_entropy(
-                logits,
-                labels,
-                self.model.tp_group,
-                tp_rank,
-                tp_world_size,
-                ignore_index=-100,
+            # Compute loss for next-token prediction
+            # Use vocab_parallel_causal_cross_entropy for tensor parallelism (DTensor) or AutoTP with vocab_parallel
+            parallelism = self.config.get("parallelism")
+            tp_group = getattr(self.model, "tp_group", None)
+            use_tp_loss = tp_group is not None and (
+                parallelism == "tensor" or (parallelism == "autotp" and self.config.get("use_vocab_parallel", True))
             )
-        else:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            if use_tp_loss:
+                import torch.distributed as dist
+
+                tp_rank = dist.get_rank(self.model.tp_group)
+                tp_world_size = dist.get_world_size(self.model.tp_group)
+                loss = vocab_parallel_causal_cross_entropy(
+                    logits,
+                    labels,
+                    self.model.tp_group,
+                    tp_rank,
+                    tp_world_size,
+                    ignore_index=-100,
+                )
+            else:
+                shift_logits = logits[:, :-1, :].contiguous().float()
+                shift_labels = labels[:, 1:].contiguous()
+                loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         # Save loss for backward pass
         self.loss = loss
