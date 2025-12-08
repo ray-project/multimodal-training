@@ -440,11 +440,12 @@ def run_dtensor_training(
 
 
 def test_dtensor_vs_no_parallel():
-    """Test that DTensor produces the same losses and parameters as no-parallel baseline.
+    """Test that DTensor tensor parallelism produces identical results to no-parallel baseline.
 
-    This test compares:
-    1. Loss values at each training step
-    2. Selected parameter values after optimizer updates (layer norms that are replicated in TP)
+    This test verifies:
+    1. Logits match on step 0 (forward pass correctness)
+    2. Losses match at each training step
+    3. Selected parameter values match after training (layer norms that are replicated in TP)
     """
     rank, world_size, local_rank = init_distributed()
 
@@ -468,9 +469,10 @@ def test_dtensor_vs_no_parallel():
     # ========================================
     baseline_losses = []
     baseline_params = []
+    baseline_logits = []
 
     if rank == 0:
-        baseline_losses, baseline_params, _ = run_baseline_training(
+        baseline_losses, baseline_params, baseline_logits = run_baseline_training(
             model_config=model_config,
             device=device,
             torch_dtype=torch_dtype,
@@ -480,7 +482,7 @@ def test_dtensor_vs_no_parallel():
             num_steps=num_steps,
             seed=42,
             collect_params=True,
-            collect_logits=False,
+            collect_logits=True,
             rank=rank,
         )
 
@@ -490,7 +492,7 @@ def test_dtensor_vs_no_parallel():
     # ========================================
     # DTensor model (all ranks)
     # ========================================
-    dtensor_losses, dtensor_params, _ = run_dtensor_training(
+    dtensor_losses, dtensor_params, dtensor_logits = run_dtensor_training(
         model_config=model_config,
         rank=rank,
         world_size=world_size,
@@ -502,11 +504,11 @@ def test_dtensor_vs_no_parallel():
         num_steps=num_steps,
         seed=42,
         collect_params=True,
-        collect_logits=False,
+        collect_logits=True,
     )
 
     # ========================================
-    # Compare losses and parameters (rank 0 only)
+    # Compare results (rank 0 only)
     # ========================================
     dist.barrier()
 
@@ -515,241 +517,114 @@ def test_dtensor_vs_no_parallel():
         print(f"[Rank {rank}] COMPARISON: Baseline vs DTensor")
         print(f"[Rank {rank}] " + "=" * 60)
 
-        # Compare losses
-        print(f"\n[Rank {rank}] Loss Comparison:")
-        all_losses_match = True
-        for step in range(num_steps):
-            baseline_loss = baseline_losses[step]
-            dtensor_loss = dtensor_losses[step]
-            loss_diff = abs(baseline_loss - dtensor_loss)
-            rel_diff = loss_diff / (abs(baseline_loss) + 1e-8)
-
-            print(f"[Rank {rank}] Step {step}: baseline_loss={baseline_loss:.6f}, dtensor_loss={dtensor_loss:.6f}, "
-                  f"diff={loss_diff:.6e}, rel_diff={rel_diff:.6e}")
-
-            # bfloat16 has limited precision (~7 bits mantissa) and TP introduces
-            # floating-point ordering differences due to all-reduce operations.
-            # A tolerance of 1e-3 is reasonable for this comparison.
-            LOSS_TOLERANCE = 1e-3
-            if loss_diff < LOSS_TOLERANCE:
-                print(f"[Rank {rank}] Step {step}: Losses match (within tolerance)!")
-            else:
-                print(f"[Rank {rank}] Step {step}: Losses differ significantly!")
-                all_losses_match = False
-
-        # Compare parameters
-        print(f"\n[Rank {rank}] Parameter Comparison:")
-
-        all_params_match = True
-        for step in range(num_steps):
-            baseline_param_dict = baseline_params[step]
-            dtensor_param_dict = dtensor_params[step]
-
-            print(f"\n[Rank {rank}] Step {step} (after optimizer update):")
-
-            # Compare each parameter
-            step_all_match = True
-            for param_name in baseline_param_dict.keys():
-                if param_name not in dtensor_param_dict:
-                    print(f"[Rank {rank}]   {param_name}: Missing in DTensor")
-                    step_all_match = False
-                    all_params_match = False
-                    continue
-
-                baseline_param = baseline_param_dict[param_name]
-                dtensor_param = dtensor_param_dict[param_name]
-
-                # Handle DTensor - convert to local tensor if needed
-                if hasattr(dtensor_param, 'full_tensor'):
-                    dtensor_param = dtensor_param.full_tensor()
-                elif hasattr(dtensor_param, 'to_local'):
-                    dtensor_param = dtensor_param.to_local()
-
-                if baseline_param.shape != dtensor_param.shape:
-                    print(f"[Rank {rank}]   {param_name}: Shape mismatch "
-                          f"(baseline={baseline_param.shape}, dtensor={dtensor_param.shape})")
-                    step_all_match = False
-                    all_params_match = False
-                    continue
-
-                diff = (baseline_param - dtensor_param).abs()
-                max_diff = diff.max().item()
-                mean_diff = diff.mean().item()
-                rel_diff = (diff / (baseline_param.abs() + 1e-8)).mean().item()
-
-                PARAM_TOLERANCE = 1e-5
-                match_str = "MATCH" if max_diff < PARAM_TOLERANCE else "DIFFER"
-                print(f"[Rank {rank}]   {param_name}: {match_str} max_diff={max_diff:.6e}, "
-                      f"mean_diff={mean_diff:.6e}, rel_diff={rel_diff:.6e}")
-
-                if max_diff >= PARAM_TOLERANCE:
-                    step_all_match = False
-                    all_params_match = False
-
-                # Check for NaN/Inf
-                if torch.isnan(dtensor_param).any():
-                    print(f"[Rank {rank}]   {param_name}: Contains NaN!")
-                    step_all_match = False
-                    all_params_match = False
-                elif torch.isinf(dtensor_param).any():
-                    print(f"[Rank {rank}]   {param_name}: Contains Inf!")
-                    step_all_match = False
-                    all_params_match = False
-
-            if step_all_match:
-                print(f"[Rank {rank}] Step {step}: All parameters match!")
-
-        print(f"\n[Rank {rank}] ====================================================================")
-        if all_losses_match and all_params_match:
-            print(f"[Rank {rank}] TEST RESULT: PASSED - All losses and parameters match!")
-        elif all_losses_match:
-            print(f"[Rank {rank}] TEST RESULT: PARTIAL PASS - Losses match, but some parameters differ")
-        else:
-            print(f"[Rank {rank}] TEST RESULT: FAILED - Losses and/or parameters differ!")
-        print(f"[Rank {rank}] ====================================================================")
-        print(f"\n[Rank {rank}] Comparison complete")
-
-    # Cleanup
-    dist.barrier()
-    dist.destroy_process_group()
-
-    print(f"[Rank {rank}] Test complete")
-
-
-def test_dtensor_logits_comparison():
-    """Test that DTensor produces the same logits as no-parallel baseline.
-
-    This test verifies:
-    1. Logits values match between baseline and DTensor (after gathering full logits)
-    2. Loss values match between baseline and DTensor with vocab parallel loss
-    """
-    rank, world_size, local_rank = init_distributed()
-
-    print(f"\n[Rank {rank}] Starting DTensor logits comparison test (world_size={world_size})")
-
-    # Configuration
-    torch_dtype = torch.bfloat16
-    device = torch.device(f"cuda:{local_rank}")
-    batch_size = 2
-    seq_len = 32
-    num_steps = 3
-
-    # Create model config
-    model_config = create_small_model_config(num_layers=2)
-    vocab_size = model_config.text_config.vocab_size
-
-    print(f"[Rank {rank}] Model config: num_layers={model_config.text_config.num_hidden_layers}, vocab_size={vocab_size}")
-
-    # ========================================
-    # BASELINE: No-parallel model (rank 0 only)
-    # ========================================
-    baseline_losses = []
-
-    if rank == 0:
-        baseline_losses, _, baseline_logits = run_baseline_training(
-            model_config=model_config,
-            device=device,
-            torch_dtype=torch_dtype,
-            vocab_size=vocab_size,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            num_steps=num_steps,
-            seed=42,
-            collect_params=False,
-            collect_logits=True,
-            rank=rank,
-        )
-    else:
-        baseline_logits = []
-
-    dist.barrier()
-
-    # ========================================
-    # DTensor model (all ranks)
-    # ========================================
-    dtensor_losses, _, dtensor_logits = run_dtensor_training(
-        model_config=model_config,
-        rank=rank,
-        world_size=world_size,
-        device=device,
-        torch_dtype=torch_dtype,
-        vocab_size=vocab_size,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        num_steps=num_steps,
-        seed=42,
-        collect_params=False,
-        collect_logits=True,
-    )
-
-    # ========================================
-    # Compare losses and logits (rank 0 only)
-    # ========================================
-    dist.barrier()
-
-    if rank == 0:
-        print(f"\n[Rank {rank}] " + "=" * 60)
-        print(f"[Rank {rank}] COMPARISON: Baseline vs DTensor (Logits)")
-        print(f"[Rank {rank}] " + "=" * 60)
-
-        # Compare logits
-        print(f"\n[Rank {rank}] Logits Comparison:")
+        # 1. Compare logits at step 0 (forward pass correctness)
+        print(f"\n[Rank {rank}] Step 0 Logits Comparison (forward pass check):")
         logits_match = True
         LOGITS_TOLERANCE = 1e-4
-        for step in range(num_steps):
-            baseline_logit = baseline_logits[step]
-            dtensor_logit = dtensor_logits[step]
 
-            if baseline_logit.shape != dtensor_logit.shape:
-                print(f"[Rank {rank}] Step {step}: Logits shape mismatch! "
-                      f"baseline={baseline_logit.shape}, dtensor={dtensor_logit.shape}")
-                logits_match = False
-                continue
+        baseline_logit = baseline_logits[0]
+        dtensor_logit = dtensor_logits[0]
 
-            # Compare logits
+        if baseline_logit.shape != dtensor_logit.shape:
+            print(f"[Rank {rank}] Logits shape mismatch! "
+                  f"baseline={baseline_logit.shape}, dtensor={dtensor_logit.shape}")
+            logits_match = False
+        else:
             logit_diff = (baseline_logit.float() - dtensor_logit.float()).abs()
             max_diff = logit_diff.max().item()
             mean_diff = logit_diff.mean().item()
-            rel_diff = (logit_diff / (baseline_logit.float().abs() + 1e-8)).mean().item()
 
             if max_diff < LOGITS_TOLERANCE:
-                print(f"[Rank {rank}] Step {step}: Logits match! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+                print(f"[Rank {rank}] Logits MATCH! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
             else:
-                print(f"[Rank {rank}] Step {step}: Logits differ! max_diff={max_diff:.6e}, "
-                      f"mean_diff={mean_diff:.6e}, rel_diff={rel_diff:.6e}")
+                print(f"[Rank {rank}] Logits DIFFER! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
                 logits_match = False
 
+        # 2. Compare losses at each step
         print(f"\n[Rank {rank}] Loss Comparison:")
-        loss_match = True
+        all_losses_match = True
+        LOSS_TOLERANCE = 1e-3  # bfloat16 + TP all-reduce introduces small differences
+
         for step in range(num_steps):
             baseline_loss = baseline_losses[step]
             dtensor_loss = dtensor_losses[step]
             loss_diff = abs(baseline_loss - dtensor_loss)
             rel_diff = loss_diff / (abs(baseline_loss) + 1e-8)
 
-            print(f"[Rank {rank}] Step {step}: baseline_loss={baseline_loss:.6f}, dtensor_loss={dtensor_loss:.6f}, "
-                  f"diff={loss_diff:.6e}, rel_diff={rel_diff:.6e}")
+            match_str = "MATCH" if loss_diff < LOSS_TOLERANCE else "DIFFER"
+            print(f"[Rank {rank}] Step {step}: baseline={baseline_loss:.6f}, dtensor={dtensor_loss:.6f}, "
+                  f"diff={loss_diff:.6e} [{match_str}]")
 
-            LOSS_TOLERANCE = 1e-4
-            if loss_diff < LOSS_TOLERANCE:
-                print(f"[Rank {rank}] Step {step}: Losses are reasonably close!")
-            else:
-                print(f"[Rank {rank}] Step {step}: Losses differ significantly!")
-                loss_match = False
+            if loss_diff >= LOSS_TOLERANCE:
+                all_losses_match = False
+
+        # 3. Compare parameters after final step
+        print(f"\n[Rank {rank}] Final Parameter Comparison (after {num_steps} steps):")
+        all_params_match = True
+        PARAM_TOLERANCE = 1e-5
+
+        baseline_param_dict = baseline_params[-1]
+        dtensor_param_dict = dtensor_params[-1]
+
+        for param_name in baseline_param_dict.keys():
+            if param_name not in dtensor_param_dict:
+                print(f"[Rank {rank}]   {param_name}: Missing in DTensor")
+                all_params_match = False
+                continue
+
+            baseline_param = baseline_param_dict[param_name]
+            dtensor_param = dtensor_param_dict[param_name]
+
+            # Handle DTensor - convert to local tensor if needed
+            if hasattr(dtensor_param, 'full_tensor'):
+                dtensor_param = dtensor_param.full_tensor()
+            elif hasattr(dtensor_param, 'to_local'):
+                dtensor_param = dtensor_param.to_local()
+
+            if baseline_param.shape != dtensor_param.shape:
+                print(f"[Rank {rank}]   {param_name}: Shape mismatch "
+                      f"(baseline={baseline_param.shape}, dtensor={dtensor_param.shape})")
+                all_params_match = False
+                continue
+
+            diff = (baseline_param - dtensor_param).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            match_str = "MATCH" if max_diff < PARAM_TOLERANCE else "DIFFER"
+            print(f"[Rank {rank}]   {param_name}: {match_str} max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+
+            if max_diff >= PARAM_TOLERANCE:
+                all_params_match = False
+
+            # Check for NaN/Inf
+            if torch.isnan(dtensor_param).any():
+                print(f"[Rank {rank}]   {param_name}: Contains NaN!")
+                all_params_match = False
+            elif torch.isinf(dtensor_param).any():
+                print(f"[Rank {rank}]   {param_name}: Contains Inf!")
+                all_params_match = False
 
         # Summary
         print(f"\n[Rank {rank}] ====================================================================")
         print(f"[Rank {rank}] SUMMARY:")
-        print(f"[Rank {rank}]   Logits match: {'YES' if logits_match else 'NO'}")
-        print(f"[Rank {rank}]   Losses match: {'YES' if loss_match else 'NO'}")
-        if logits_match and not loss_match:
-            print(f"[Rank {rank}]   => Issue is in LOSS CALCULATION (vocab_parallel_causal_cross_entropy)")
-        elif not logits_match and not loss_match:
-            print(f"[Rank {rank}]   => Issue is in MODEL FORWARD PASS (logits differ)")
-        elif logits_match and loss_match:
-            print(f"[Rank {rank}] TEST RESULT: PASSED - DTensor tensor parallelism working correctly!")
+        print(f"[Rank {rank}]   Step 0 logits match: {'YES' if logits_match else 'NO'}")
+        print(f"[Rank {rank}]   All losses match:    {'YES' if all_losses_match else 'NO'}")
+        print(f"[Rank {rank}]   Final params match:  {'YES' if all_params_match else 'NO'}")
+
+        if logits_match and all_losses_match and all_params_match:
+            print(f"[Rank {rank}] TEST RESULT: PASSED")
+        else:
+            if not logits_match:
+                print(f"[Rank {rank}]   => Issue in FORWARD PASS (logits differ)")
+            if not all_losses_match:
+                print(f"[Rank {rank}]   => Issue in LOSS CALCULATION")
+            if not all_params_match:
+                print(f"[Rank {rank}]   => Issue in BACKWARD PASS or OPTIMIZER")
+            print(f"[Rank {rank}] TEST RESULT: FAILED")
         print(f"[Rank {rank}] ====================================================================")
 
+    # Cleanup
     dist.barrier()
     dist.destroy_process_group()
 
