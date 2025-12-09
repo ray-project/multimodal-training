@@ -50,17 +50,17 @@ data:
     - laion_pop_train
   data_registry:
     mscoco2017_train_captions:
-      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_train_qwen.json"
-      data_path: "/mnt/local_storage/mscoco2017"
+      annotation_path: "/path/to/mscoco2017/annotations/coco2017_train.json"
+      data_path: "/path/to/mscoco2017"
     mscoco2017_val_captions:
-      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_val_qwen.json"
-      data_path: "/mnt/local_storage/mscoco2017"
+      annotation_path: "/path/to/mscoco2017/annotations/coco2017_val.json"
+      data_path: "/path/to/mscoco2017"
     laion_pop_train:
-      annotation_path: "/mnt/local_storage/laion/laion_pop_train.jsonl"
-      data_path: "/mnt/local_storage/laion/images"
+      annotation_path: "/path/to/laion_pop/laion_pop_train.jsonl"
+      data_path: "/path/to/laion_pop/images"
     laion_pop_val:
-      annotation_path: "/mnt/local_storage/laion/laion_pop_val.jsonl"
-      data_path: "/mnt/local_storage/laion/images"
+      annotation_path: "/path/to/laion_pop/laion_pop_val.jsonl"
+      data_path: "/path/to/laion_pop/images"
   num_workers: 4
   pin_memory: true
   data_flatten: true
