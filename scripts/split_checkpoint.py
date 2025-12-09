@@ -16,7 +16,7 @@ import logging
 import os
 
 import torch
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModelForVision2Seq
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,8 +44,9 @@ def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool =
     logger.info(f"Model config loaded: {config.model_type}")
 
     # Load the full model with all weights
+    # Use AutoModelForVision2Seq to include the lm_head weights (needed for untied embeddings)
     logger.info("Loading full model (this may take a while)...")
-    model = AutoModel.from_pretrained(
+    model = AutoModelForVision2Seq.from_pretrained(
         model_name,
         trust_remote_code=trust_remote_code,
         torch_dtype=torch.bfloat16,  # Use bfloat16 to save memory
@@ -58,24 +59,44 @@ def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool =
     logger.info(f"Total parameters in model: {len(state_dict)} tensors")
 
     # Split state dict into vision and text components
+    # Keys from AutoModelForVision2Seq:
+    #   - model.visual.* -> vision model
+    #   - model.language_model.* -> text model
+    #   - lm_head.* -> text model (separate from embeddings when tie_word_embeddings=False)
+    #   - visual.* -> vision model (for some model versions)
+    #   - language_model.* -> text model (for some model versions)
     vision_state_dict = {}
     text_state_dict = {}
 
     for key, value in state_dict.items():
-        if key.startswith("visual."):
-            # Vision model weights - remove "visual." prefix
+        # Handle vision model weights
+        if key.startswith("model.visual."):
+            # Vision model weights - remove "model.visual." prefix
+            new_key = key[len("model.visual.") :]
+            vision_state_dict[new_key] = value
+        elif key.startswith("visual."):
+            # Alternative format: remove "visual." prefix
             new_key = key[len("visual.") :]
             vision_state_dict[new_key] = value
-        else:
-            # Text model weights - remove common prefixes for cleaner keys
-            new_key = key
-            # Remove 'language_model.' prefix if present
-            if new_key.startswith("language_model."):
-                new_key = new_key[len("language_model.") :]
-            # Remove 'model.' prefix if present (and not already removed above)
-            elif new_key.startswith("model."):
-                new_key = new_key[len("model.") :]
+        # Handle text model and lm_head weights
+        elif key.startswith("model.language_model."):
+            # Text model weights - remove "model.language_model." prefix
+            new_key = key[len("model.language_model.") :]
             text_state_dict[new_key] = value
+        elif key.startswith("language_model."):
+            # Alternative format: remove "language_model." prefix
+            new_key = key[len("language_model.") :]
+            text_state_dict[new_key] = value
+        elif key.startswith("lm_head."):
+            # lm_head weights - keep as is (important for untied embeddings)
+            text_state_dict[key] = value
+        elif key.startswith("model."):
+            # Other model. prefixed keys go to text
+            new_key = key[len("model.") :]
+            text_state_dict[new_key] = value
+        else:
+            # Other keys go to text
+            text_state_dict[key] = value
 
     logger.info(f"Vision model: {len(vision_state_dict)} tensors")
     logger.info(f"Text model: {len(text_state_dict)} tensors")

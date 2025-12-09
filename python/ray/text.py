@@ -138,10 +138,12 @@ class BaseTextTrainer(Trainer):
             import os
 
             text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
-            # Temporarily assign model for loading
+            # Temporarily assign model and lm_head for loading
             self.model = model
+            self.lm_head = lm_head
             self.load_pretrained_weights(text_checkpoint_path)
             model = self.model
+            lm_head = self.lm_head
 
         # Activation checkpointing
         activation_checkpointing = config["activation_checkpointing"]
@@ -214,10 +216,12 @@ class BaseTextTrainer(Trainer):
             import os
 
             text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
-            # Temporarily assign model for loading
+            # Temporarily assign model and lm_head for loading
             self.model = model
+            self.lm_head = lm_head
             self.load_pretrained_weights(text_checkpoint_path)
             model = self.model
+            lm_head = self.lm_head
 
         # Apply activation checkpointing
         activation_checkpointing = config["activation_checkpointing"]
@@ -290,10 +294,12 @@ class BaseTextTrainer(Trainer):
             import os
 
             text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
-            # Temporarily assign model for loading
+            # Temporarily assign model and lm_head for loading
             self.model = model
+            self.lm_head = lm_head
             self.load_pretrained_weights(text_checkpoint_path)
             model = self.model
+            lm_head = self.lm_head
 
         # Apply activation checkpointing
         activation_checkpointing = config["activation_checkpointing"]
@@ -524,35 +530,61 @@ class BaseTextTrainer(Trainer):
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
             state_dict = checkpoint.get("model", checkpoint)
 
-            # Remove 'language_model.' prefix if present (HuggingFace full model vs text-only component)
-            # Also handle 'model.' prefix
-            cleaned_state_dict = {}
-            for key, value in state_dict.items():
-                new_key = key
-                # Remove 'language_model.' prefix
-                if new_key.startswith("language_model."):
-                    new_key = new_key[len("language_model.") :]
-                # Remove 'model.' prefix if it's still there
-                elif new_key.startswith("model."):
-                    new_key = new_key[len("model.") :]
-                cleaned_state_dict[new_key] = value
+            # Separate lm_head weights from text model weights
+            # lm_head weights have 'lm_head.' prefix (important for untied embeddings)
+            model_state_dict = {}
+            lm_head_state_dict = {}
 
-            # Load into model
+            for key, value in state_dict.items():
+                if key.startswith("lm_head."):
+                    # Keep lm_head keys for separate loading
+                    lm_head_state_dict[key] = value
+                else:
+                    new_key = key
+                    # Remove 'language_model.' prefix
+                    if new_key.startswith("language_model."):
+                        new_key = new_key[len("language_model.") :]
+                    # Remove 'model.' prefix if it's still there
+                    elif new_key.startswith("model."):
+                        new_key = new_key[len("model.") :]
+                    model_state_dict[new_key] = value
+
+            # Load text model weights
             if self.use_deepspeed and self.deepspeed_engine is not None:
                 # For DeepSpeed, load into the wrapped module
                 missing_keys, unexpected_keys = self.deepspeed_engine.module.load_state_dict(
-                    cleaned_state_dict, strict=False
+                    model_state_dict, strict=False
                 )
             else:
-                missing_keys, unexpected_keys = self.model.load_state_dict(cleaned_state_dict, strict=False)
+                missing_keys, unexpected_keys = self.model.load_state_dict(model_state_dict, strict=False)
 
             if missing_keys:
                 logger.warning(f"[r{self.rank}] Missing keys when loading text weights: {missing_keys[:10]}")
             if unexpected_keys:
                 logger.warning(f"[r{self.rank}] Unexpected keys when loading text weights: {unexpected_keys[:10]}")
 
+            # Load lm_head weights if available and lm_head exists
+            if lm_head_state_dict and hasattr(self, "lm_head") and self.lm_head is not None:
+                # lm_head.weight -> weight
+                cleaned_lm_head_dict = {}
+                for key, value in lm_head_state_dict.items():
+                    new_key = key[len("lm_head.") :]  # Remove 'lm_head.' prefix
+                    cleaned_lm_head_dict[new_key] = value
+
+                lm_missing, lm_unexpected = self.lm_head.load_state_dict(cleaned_lm_head_dict, strict=False)
+                if lm_missing:
+                    logger.warning(f"[r{self.rank}] Missing keys when loading lm_head weights: {lm_missing}")
+                if lm_unexpected:
+                    logger.warning(f"[r{self.rank}] Unexpected keys when loading lm_head weights: {lm_unexpected}")
+                logger.info(f"[r{self.rank}] Loaded lm_head pretrained weights ({len(cleaned_lm_head_dict)} parameters)")
+            elif lm_head_state_dict:
+                logger.warning(
+                    f"[r{self.rank}] Checkpoint contains lm_head weights but self.lm_head is not set. "
+                    "lm_head weights will not be loaded."
+                )
+
             logger.info(
-                f"[r{self.rank}] Successfully loaded pretrained text weights ({len(cleaned_state_dict)} parameters)"
+                f"[r{self.rank}] Successfully loaded pretrained text weights ({len(model_state_dict)} parameters)"
             )
             return True
 
