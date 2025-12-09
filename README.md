@@ -275,7 +275,8 @@ vision:
 text:
   model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
   model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
-  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed"
+  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed", "autotp"
+  autotp_size: null  # Optional tensor parallel size when using AutoTP (defaults to world size)
 ...
 
 # Training configuration

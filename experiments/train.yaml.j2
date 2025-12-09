@@ -15,12 +15,14 @@ vision:
 text:
   model_type: "{{ text_model_type }}"  # Options: "qwen2_5_vl"
   model_name: "{{ text_model_name }}"  # Path to pretrained model
-  parallelism: "{{ text_parallelism }}"  # Options: "none", "tensor", "deepspeed"
+  parallelism: "{{ text_parallelism }}"  # Options: "none", "tensor", "deepspeed", "autotp"
   dtype: "{{ text_dtype }}"  # Options: "float16", "bfloat16", "float32"
   attention_backend: "{{ text_attention_backend }}"  # Options: "sdpa", "flash_attention_2", "eager"
   activation_checkpointing: {{ text_activation_checkpointing }}
   autocast: {{ text_autocast }}  # Enable torch autocast for mixed precision
   zero_stage: {{ text_zero_stage }}  # DeepSpeed ZeRO stage (1, 2, or 3)
+  autotp_size: {{ text_autotp_size }}  # Optional tensor parallel size when using AutoTP (set automatically based on parallel_size)
+  tp_overlap_comm: {{ text_tp_overlap_comm }}  # Enable TP communication overlap for AutoTP if supported
 
 # Training configuration
 training:
@@ -34,7 +36,8 @@ training:
   weight_decay: {{ weight_decay }}  # L2 regularization strength (weight decay)
   gradient_accumulation_steps: {{ gradient_accumulation_steps }}
   seed: {{ seed }}
-  parallel_size: {{ parallel_size }}  # Number of processes per model (vision and text)
+  dp_size: {{ dp_size }}  # Data parallel size (number of DP replicas)
+  parallel_size: {{ parallel_size }}  # TP/SP size per DP replica (total GPUs = dp_size * parallel_size)
   collocate: {{ collocate }}  # Whether to collocate vision and text models on same GPUs
   clip_grad_norm: {{ clip_grad_norm }}  # Enable gradient clipping
   max_grad_norm: {{ max_grad_norm }}  # Maximum gradient norm (e.g., 1.0)

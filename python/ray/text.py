@@ -1,4 +1,5 @@
 import logging
+import time
 from abc import abstractmethod
 
 import ray
@@ -104,6 +105,19 @@ class BaseTextTrainer(Trainer):
                 init_distributed_comm(backend="nccl", use_deepspeed=True)
             return self._build_model_with_deepspeed(config, model_config, device, torch_dtype, load_pretrained_path)
 
+        if parallelism == "autotp":
+            import os
+
+            import torch.distributed as dist
+
+            from .utils import init_distributed_comm
+
+            if not dist.is_initialized():
+                world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+                if world_size_env > 1:
+                    init_distributed_comm(backend="nccl", use_deepspeed=True)
+            return self._build_model_with_autotp(config, model_config, device, torch_dtype, load_pretrained_path)
+
         # Validate tensor parallelism compatibility
         if parallelism == "tensor":
             self._validate_tensor_parallelism(model_config)
@@ -142,31 +156,35 @@ class BaseTextTrainer(Trainer):
         lm_head.to(device=device, dtype=torch_dtype)
 
         # Tie weights between lm_head and embeddings
-        embed_module = self._get_embedding_module(model)
-        if embed_module is None:
-            raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            embed_module = self._get_embedding_module(model)
+            if embed_module is None:
+                raise ValueError("Unable to locate embedding module for tying the LM head.")
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         model.train()
         lm_head.train()
 
         return model, lm_head, tp_group
 
-    def _validate_tensor_parallelism(self, model_config):
+    def _validate_tensor_parallelism(self, model_config, tp_world_size=None):
         """Validate that tensor parallelism is compatible with model config."""
-        init_distributed_comm(backend="nccl")
-        import torch.distributed as dist
+        if tp_world_size is None:
+            init_distributed_comm(backend="nccl")
+            import torch.distributed as dist
 
-        if dist.is_initialized():
+            if not dist.is_initialized():
+                return
             tp_world_size = dist.get_world_size()
-            # Get num_key_value_heads from text_config
-            text_config = getattr(model_config, "text_config", model_config)
-            num_kv_heads = text_config.num_key_value_heads
-            if num_kv_heads % tp_world_size != 0:
-                raise ValueError(
-                    f"Tensor parallel world size must divide num_key_value_heads. "
-                    f"Got world size {tp_world_size} and num_key_value_heads {num_kv_heads}."
-                )
+
+        # Get num_key_value_heads from text_config
+        text_config = getattr(model_config, "text_config", model_config)
+        num_kv_heads = text_config.num_key_value_heads
+        if num_kv_heads % tp_world_size != 0:
+            raise ValueError(
+                f"Tensor parallel world size must divide num_key_value_heads. "
+                f"Got world size {tp_world_size} and num_key_value_heads {num_kv_heads}."
+            )
 
     def _build_model_with_deepspeed(self, config, model_config, device, torch_dtype, load_pretrained_path=None):
         """
@@ -182,12 +200,10 @@ class BaseTextTrainer(Trainer):
         Returns:
             (model_engine, lm_head, tp_group) tuple where model_engine is DeepSpeed engine
         """
-        from contextlib import nullcontext
-
         # Build model on target device
         torch.set_default_device(device)
         logger.debug(f"[r{self.rank}] Creating text model for DeepSpeed...")
-        model, lm_head = self._create_model_and_lm_head(model_config, nullcontext())
+        model, lm_head = self._create_model_and_lm_head(model_config)
         torch.set_default_device("cpu")
 
         model.to(torch_dtype)
@@ -208,10 +224,11 @@ class BaseTextTrainer(Trainer):
         self._apply_activation_checkpointing(model, activation_checkpointing, "text model")
 
         # Tie weights between lm_head and embeddings
-        embed_module = self._get_embedding_module(model)
-        if embed_module is None:
-            raise ValueError("Unable to locate embedding module for tying the LM head.")
-        self._tie_lm_head_to_embeddings(lm_head, embed_module)
+        if getattr(model.config, "tie_word_embeddings", True):
+            embed_module = self._get_embedding_module(model)
+            if embed_module is None:
+                raise ValueError("Unable to locate embedding module for tying the LM head.")
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
 
         # Attach lm_head to model so DeepSpeed can manage both
         model.lm_head = lm_head
@@ -221,16 +238,206 @@ class BaseTextTrainer(Trainer):
         # The helper method will deduplicate to avoid passing the same parameter twice to DeepSpeed
         params = self._collect_parameters_from_modules(model, lm_head)
 
-        # Initialize with DeepSpeed using base class method
+        # Create the optimizer externally to ensure consistency with DTensor path
+        # This uses the same _build_optimizer logic (Adam with proper weight decay groups)
+        self._build_optimizer(params)
+        external_optimizer = self.optimizer
+
+        # Initialize with DeepSpeed using base class method and external optimizer
         model_engine, optimizer, _, _ = self._initialize_deepspeed(
             model=model,
             params=params,
             config=config,
             torch_dtype=torch_dtype,
+            optimizer=external_optimizer,
         )
 
         # Return the engine in place of model (lm_head stays separate, tp_group is None)
         return model_engine, lm_head, None
+
+    def _build_model_with_autotp(self, config, model_config, device, torch_dtype, load_pretrained_path=None):
+        """
+        Build model with DeepSpeed AutoTP tensor parallelism.
+
+        Args:
+            config: Training config dict
+            model_config: Model configuration
+            device: Target device
+            torch_dtype: Target dtype
+            load_pretrained_path: Optional path to pretrained checkpoint directory
+
+        Returns:
+            (model_engine, lm_head, tp_group) tuple where model_engine is DeepSpeed engine
+        """
+        import torch.distributed as dist
+        from deepspeed.module_inject.layers import set_autotp_mode
+        from deepspeed.utils import groups
+
+        # Enable AutoTP instrumentation before model creation
+        set_autotp_mode(training=True)
+
+        # Build model on target device
+        torch.set_default_device(device)
+        logger.debug(f"[r{self.rank}] Creating text model for AutoTP...")
+        model, lm_head = self._create_model_and_lm_head(model_config)
+        torch.set_default_device("cpu")
+
+        model.to(torch_dtype)
+        lm_head.to(torch_dtype)
+
+        # Load pretrained weights BEFORE DeepSpeed wrapping
+        if load_pretrained_path:
+            import os
+
+            text_checkpoint_path = os.path.join(load_pretrained_path, "text_model.pt")
+            # Temporarily assign model for loading
+            self.model = model
+            self.load_pretrained_weights(text_checkpoint_path)
+            model = self.model
+
+        # Apply activation checkpointing
+        activation_checkpointing = config["activation_checkpointing"]
+        self._apply_activation_checkpointing(model, activation_checkpointing, "text model")
+
+        # Tie weights between lm_head and embeddings
+        if getattr(model.config, "tie_word_embeddings", True):
+            embed_module = self._get_embedding_module(model)
+            if embed_module is None:
+                raise ValueError("Unable to locate embedding module for tying the LM head.")
+            self._tie_lm_head_to_embeddings(lm_head, embed_module)
+
+        # Attach lm_head to model so DeepSpeed can manage both
+        model.lm_head = lm_head
+
+        # Collect parameters from model and lm_head
+        params = self._collect_parameters_from_modules(model, lm_head)
+
+        # Determine AutoTP size (defaults to world size if not provided)
+        autotp_size = config.get("autotp_size") or config.get("tensor_parallel_size")
+        if autotp_size is None:
+            autotp_size = dist.get_world_size() if dist.is_initialized() else 1
+        autotp_size = int(autotp_size)
+        if autotp_size <= 0:
+            raise ValueError(f"autotp_size must be > 0, got {autotp_size}")
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            if autotp_size > world_size or world_size % autotp_size != 0:
+                raise ValueError(
+                    f"Invalid autotp_size {autotp_size} for world size {world_size}: must divide world size"
+                )
+            data_parallel_size = world_size // autotp_size
+            logger.debug(
+                f"[r{self.rank}] AutoTP sizes -> tp={autotp_size}, data_parallel={data_parallel_size}, world={world_size}"
+            )
+        elif autotp_size > 1:
+            raise ValueError("autotp_size > 1 requires torch.distributed to be initialized")
+
+        # Validate tensor parallelism compatibility with chosen AutoTP size
+        self._validate_tensor_parallelism(model_config, tp_world_size=autotp_size)
+
+        # Count parameters before TP sharding for logging
+        params_before_tp = sum(p.numel() for p in model.parameters())
+        logger.debug(f"[r{self.rank}] Parameters BEFORE TP sharding: {params_before_tp:,}")
+
+        # Apply tensor parallelism with deepspeed.tp_model_init()
+        # This actually shards the model parameters across TP ranks
+        # NOTE: set_autotp_mode(training=True) alone only enables tracking but does NOT shard weights.
+        # We must call tp_model_init() to perform the actual module injection and weight sharding.
+        import deepspeed
+
+        logger.debug(f"[r{self.rank}] Applying TP sharding with deepspeed.tp_model_init (tp_size={autotp_size})...")
+        model = deepspeed.tp_model_init(model, tp_size=autotp_size, dtype=torch_dtype)
+
+        # Count parameters after TP sharding
+        params_after_tp = sum(p.numel() for p in model.parameters())
+        reduction_pct = 100 * (params_before_tp - params_after_tp) / params_before_tp
+        logger.debug(f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)")
+
+        # Get TP group early for vocab parallel embedding
+        tp_group = None
+        try:
+            tp_group = groups.get_tensor_model_parallel_group()
+        except Exception:
+            tp_group = None
+
+        # Apply vocabulary-parallel embedding for proper parallel loss computation
+        # DeepSpeed AutoTP doesn't partition embeddings/lm_head by vocabulary dimension,
+        # so we replace them with VocabParallelEmbedding for correct loss computation
+        if tp_group is not None and config.get("use_vocab_parallel", True):
+            tp_rank = groups.get_tensor_model_parallel_rank()
+            tp_world_size = groups.get_tensor_model_parallel_world_size()
+
+            original_embedding = self._get_embedding_module(model)
+            if original_embedding is not None:
+                logger.debug(
+                    f"[r{self.rank}] Replacing embedding with VocabParallelEmbedding "
+                    f"(vocab_size={original_embedding.num_embeddings}, tp_size={tp_world_size})"
+                )
+
+                # Create VocabParallelEmbedding
+                vocab_parallel_embedding = VocabParallelEmbedding(
+                    num_embeddings=original_embedding.num_embeddings,
+                    embedding_dim=original_embedding.embedding_dim,
+                    padding_idx=original_embedding.padding_idx,
+                    tp_group=tp_group,
+                    dtype=original_embedding.weight.dtype,
+                    device=device,
+                )
+
+                # Copy the appropriate partition of weights from original embedding
+                with torch.no_grad():
+                    start_idx = vocab_parallel_embedding.vocab_start_index
+                    end_idx = vocab_parallel_embedding.vocab_end_index
+                    vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
+
+                # Replace the embedding in the model
+                self._replace_embedding_module(model, vocab_parallel_embedding)
+
+                # Handle lm_head based on weight tying configuration
+                lm_head = model.lm_head
+                if getattr(model.config, "tie_word_embeddings", True):
+                    # Tied weights: lm_head shares weight with embedding
+                    lm_head.weight = vocab_parallel_embedding.weight
+                    logger.debug(f"[r{self.rank}] lm_head weight tied to VocabParallelEmbedding")
+                else:
+                    # Untied weights: lm_head needs its own partitioned weight
+                    original_lm_head_weight = lm_head.weight.data.clone()
+                    lm_head.weight = nn.Parameter(
+                        original_lm_head_weight[start_idx:end_idx, :].to(device)
+                    )
+                    logger.debug(f"[r{self.rank}] lm_head weight sharded independently (untied)")
+
+                logger.debug(
+                    f"[r{self.rank}] VocabParallelEmbedding applied: vocab_range=[{start_idx}, {end_idx}), "
+                    f"partition_size={end_idx - start_idx}"
+                )
+
+        # Re-collect parameters after TP sharding (shapes have changed)
+        # The lm_head is attached to model, so we get it from there
+        lm_head = model.lm_head
+        params = self._collect_parameters_from_modules(model, lm_head)
+
+        # Create the optimizer externally to ensure consistency with DTensor path
+        # This uses the same _build_optimizer logic (Adam with proper weight decay groups)
+        self._build_optimizer(params)
+        external_optimizer = self.optimizer
+
+        tp_overlap_comm = config.get("tp_overlap_comm", None)
+        tensor_parallel_cfg = {"autotp_size": autotp_size}
+        if tp_overlap_comm is not None:
+            tensor_parallel_cfg["tp_overlap_comm"] = bool(tp_overlap_comm)
+
+        # Initialize DeepSpeed with AutoTP configuration and external optimizer
+        model_engine, optimizer, _, _ = self._initialize_deepspeed(
+            model=model,
+            params=params,
+            config=config,
+            torch_dtype=torch_dtype,
+            tensor_parallel_config=tensor_parallel_cfg,
+            optimizer=external_optimizer,
+        )
+
+        return model_engine, lm_head, tp_group
 
     def _apply_tensor_parallelism(self, model, lm_head, model_config, device):
         """Apply tensor parallelism to model, lm_head, and return tp_group."""
@@ -285,8 +492,16 @@ class BaseTextTrainer(Trainer):
         for layer in layers:
             parallelize_module(layer, tp_mesh, tp_mapping, src_data_rank=0)
 
-        # NOTE: Do NOT parallelize lm_head here because its weights will be
-        # tied to the VocabParallelEmbedding, which already has the correct sharding
+        # Handle lm_head sharding based on weight tying configuration
+        # If weights are tied, lm_head.weight will be set to VocabParallelEmbedding.weight later
+        # If weights are NOT tied, we must manually shard lm_head for correct vocab-parallel loss
+        if not getattr(model.config, "tie_word_embeddings", True):
+            logger.debug(f"[r{self.rank}] Sharding lm_head for untied embeddings (vocab_range=[{start_idx}, {end_idx}))")
+            with torch.no_grad():
+                original_lm_head_weight = lm_head.weight.data.clone()
+                lm_head.weight = nn.Parameter(
+                    original_lm_head_weight[start_idx:end_idx, :].to(device)
+                )
 
         return tp_mesh.get_group()
 
@@ -379,11 +594,11 @@ class BaseTextTrainer(Trainer):
 
         self.model.tp_group = tp_group
 
-        # Build optimizer (skip if using DeepSpeed)
+        # Build optimizer (skip if using DeepSpeed - optimizer is created in build methods)
         if not self.use_deepspeed:
             self._build_optimizer(self._collect_optimizer_parameters())
         else:
-            logger.debug(f"[r{self.rank}] Using DeepSpeed optimizer, skipping manual optimizer creation")
+            logger.debug(f"[r{self.rank}] Using external optimizer with DeepSpeed (already created)")
 
         # Build LR scheduler for both DeepSpeed and non-DeepSpeed modes
         self._build_scheduler(self.config["num_iterations"])
@@ -457,8 +672,12 @@ class BaseTextTrainer(Trainer):
             iteration: Training iteration number for synchronization verification
 
         Returns:
-            Loss value (scalar tensor)
+            Dict with "loss" (scalar tensor) and optionally "forward_time_ms" (float) if profiling is enabled
         """
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            forward_start = time.perf_counter()
+
         # Store iteration for verification
         self._current_iteration = iteration
         logger.debug(f"[r{self.rank}] Text forward_step: iteration={iteration}")
@@ -506,7 +725,20 @@ class BaseTextTrainer(Trainer):
         # Each rank owns gradients for its own microbatch
         self._vision_grad_owner_rank = self.rank
 
-        return self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
+        # Get vision forward timing if available
+        vision_forward_time_ms = vision_data.get("forward_time_ms", 0.0)
+
+        loss = self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
+
+        # Synchronize and measure timing only when profiling is enabled
+        result = {"loss": loss}
+        if profile_time:
+            torch.cuda.synchronize()
+            forward_time_ms = (time.perf_counter() - forward_start) * 1000
+            result["forward_time_ms"] = forward_time_ms
+            result["vision_forward_time_ms"] = vision_forward_time_ms
+
+        return result
 
     def _forward_step_impl(self, vision_embeddings, vision_sample_index=None, iteration=-1):
         """
@@ -599,9 +831,10 @@ class BaseTextTrainer(Trainer):
         # Now vision_embeddings is [batch_size, num_vision_tokens, hidden_size] or [1, num_tokens, hidden]
 
         # Enable gradient computation for vision embeddings (needed for backward pass)
-        # If this came via CUDA IPC, we need to clone it to avoid keeping the shared memory alive
-        # The IPC tensor is just a view into the sender's memory, so we make our own copy
-        vision_embeddings = vision_embeddings.clone().requires_grad_(True)
+        # Detach first so the new tensor is a leaf and gets .grad populated.
+        # If this came via CUDA IPC, this also avoids keeping the shared memory alive.
+        vision_embeddings = vision_embeddings.detach().clone().requires_grad_(True)
+        vision_embeddings.retain_grad()
 
         # Save for backward pass
         self.vision_embeddings = vision_embeddings
@@ -673,26 +906,32 @@ class BaseTextTrainer(Trainer):
             # Get logits from lm_head
             logits = self.lm_head(text_outputs.last_hidden_state)
 
-        logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
+            logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
 
-        # Compute loss for next-token prediction
-        if getattr(self.model, "tp_group", None):
-            import torch.distributed as dist
-
-            tp_rank = dist.get_rank(self.model.tp_group)
-            tp_world_size = dist.get_world_size(self.model.tp_group)
-            loss = vocab_parallel_causal_cross_entropy(
-                logits,
-                labels,
-                self.model.tp_group,
-                tp_rank,
-                tp_world_size,
-                ignore_index=-100,
+            # Compute loss for next-token prediction
+            # Use vocab_parallel_causal_cross_entropy for tensor parallelism (DTensor) or AutoTP with vocab_parallel
+            parallelism = self.config.get("parallelism")
+            tp_group = getattr(self.model, "tp_group", None)
+            use_tp_loss = tp_group is not None and (
+                parallelism == "tensor" or (parallelism == "autotp" and self.config.get("use_vocab_parallel", True))
             )
-        else:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            if use_tp_loss:
+                import torch.distributed as dist
+
+                tp_rank = dist.get_rank(self.model.tp_group)
+                tp_world_size = dist.get_world_size(self.model.tp_group)
+                loss = vocab_parallel_causal_cross_entropy(
+                    logits,
+                    labels,
+                    self.model.tp_group,
+                    tp_rank,
+                    tp_world_size,
+                    ignore_index=-100,
+                )
+            else:
+                shift_logits = logits[:, :-1, :].contiguous().float()
+                shift_labels = labels[:, 1:].contiguous()
+                loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         # Save loss for backward pass
         self.loss = loss
@@ -706,14 +945,26 @@ class BaseTextTrainer(Trainer):
         Run backward pass on the text model.
 
         Returns:
-            Gradients w.r.t. vision embeddings to be passed back to VisionTrainer.
-            If CUDA IPC is enabled, returns a TensorTransferRequest dict.
-            Otherwise returns the gradient tensor directly.
+            Dict with "grad" (gradients w.r.t. vision embeddings or TensorTransferRequest dict)
+            and optionally "backward_time_ms" (float) if profiling is enabled.
         """
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            backward_start = time.perf_counter()
+
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} backward_step: computing gradients")
 
         # Backward pass: compute gradients
-        self.loss.backward()
+        if self.use_deepspeed and self.deepspeed_engine is not None:
+            self.deepspeed_engine.backward(self.loss)
+        else:
+            self.loss.backward()
+
+        # Synchronize and measure timing only when profiling is enabled
+        backward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
         # Extract gradients from vision_embeddings leaf tensor
         if self.vision_embeddings is None or self.vision_embeddings.grad is None:
@@ -739,8 +990,15 @@ class BaseTextTrainer(Trainer):
         self.loss = None
         self.vision_embeddings = None
 
+        # Build result dict, conditionally including timing
+        def _build_result(grad_data):
+            result = {"grad": grad_data}
+            if profile_time:
+                result["backward_time_ms"] = backward_time_ms
+            return result
+
         if grad_to_send is None:
-            return None
+            return _build_result(None)
 
         # Use CUDA IPC if configured and receiver info is available
         if self.use_ipc and self.receiver_gpu_ids is not None:
@@ -757,10 +1015,10 @@ class BaseTextTrainer(Trainer):
             logger.debug(
                 f"[r{self.rank}] {self.__class__.__name__}: Created gradient transfer request (use_ipc={transfer_request.use_ipc})"
             )
-            return transfer_request.to_dict()
+            return _build_result(transfer_request.to_dict())
         else:
             # Return gradients directly (Ray's default transport)
-            return grad_to_send
+            return _build_result(grad_to_send)
 
     def zero_grad(self):
         """Zero out model and lm_head gradients to free memory."""
@@ -847,9 +1105,8 @@ class BaseTextTrainer(Trainer):
             return False
 
 
-@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
-class QwenTextTrainer(BaseTextTrainer):
-    """Qwen2.5-VL text trainer."""
+class QwenTextMixin:
+    """Qwen2.5-VL text model helpers shared by Ray and standalone trainers."""
 
     def _load_model_config(self, model_name):
         """Load Qwen2.5-VL model config."""
@@ -886,3 +1143,10 @@ class QwenTextTrainer(BaseTextTrainer):
             "mlp.up_proj": ColwiseParallel(),
             "mlp.down_proj": RowwiseParallel(),
         }
+
+
+@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
+class QwenTextTrainer(QwenTextMixin, BaseTextTrainer):
+    """Qwen2.5-VL text trainer."""
+
+    pass

@@ -73,7 +73,7 @@ class Trainer(RayActor):
         # Setup reproducibility for tensor/sequence parallelism
         generator = None
         worker_init_fn = None
-        if parallelism in ["tensor", "sequence"]:
+        if parallelism in ["tensor", "sequence", "autotp"]:
             import random as _rnd
 
             import numpy as _np
@@ -406,6 +406,11 @@ class Trainer(RayActor):
                 "sharded_norm_sq": sharded_norm_sq,
             }
 
+        elif parallelism == "autotp":
+            # AutoTP uses DeepSpeed-managed tensor parallel groups; treat like DeepSpeed for clipping
+            norm_sq = self._compute_grad_norm_squared(all_params)
+            return {"type": "deepspeed", "norm_sq": norm_sq}
+
         elif parallelism == "deepspeed":
             # DeepSpeed: check if sequence parallelism is enabled
             # If sequence parallelism is enabled, treat as sequence parallelism
@@ -617,16 +622,72 @@ class Trainer(RayActor):
             f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
         )
 
-    def _initialize_deepspeed(self, model, params, config, torch_dtype, mpu=None):
+    def _build_deepspeed_optimizer_params(self, model, config):
+        """
+        Build optimizer parameter groups for DeepSpeed with proper weight decay handling.
+
+        Excludes bias, LayerNorm, and RMSNorm parameters from weight decay,
+        matching the behavior of _build_optimizer() for DTensor path.
+
+        Args:
+            model: The model to extract named parameters from
+            config: Training config dict containing weight_decay
+
+        Returns:
+            list: Parameter groups for DeepSpeed optimizer
+        """
+        weight_decay = config["weight_decay"]
+
+        # If no weight decay, return simple param list
+        if weight_decay == 0.0:
+            return None  # Use default behavior
+
+        # Collect named parameters
+        named_params = list(model.named_parameters())
+
+        # Get parameter names that should have decay (excludes bias, norm, etc.)
+        decay_param_names = self._get_decay_parameter_names(named_params)
+
+        # Split into decay and no-decay groups
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+            if name in decay_param_names:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+        rank = getattr(self, "rank", 0)
+        logger.debug(
+            f"[r{rank}] DeepSpeed optimizer groups: {len(decay_params)} params with decay, "
+            f"{len(no_decay_params)} params without decay (weight_decay={weight_decay})"
+        )
+
+        # Return parameter groups in DeepSpeed format
+        return [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+    def _initialize_deepspeed(
+        self, model, params, config, torch_dtype, mpu=None, tensor_parallel_config=None, optimizer=None
+    ):
         """
         Initialize DeepSpeed engine with the given model and parameters.
 
         Args:
             model: The model to wrap with DeepSpeed
-            params: List of parameters to optimize
+            params: List of parameters to optimize (may be overridden by parameter groups)
             config: Training config dict
             torch_dtype: Target dtype (torch.float16 or torch.bfloat16)
             mpu: Optional model/sequence parallel state module to pass into DeepSpeed
+            tensor_parallel_config: Optional tensor parallel configuration (e.g., AutoTP settings)
+            optimizer: Optional pre-created optimizer. If provided, DeepSpeed will use this
+                       optimizer instead of creating one internally. This ensures consistency
+                       between DeepSpeed and non-DeepSpeed training paths.
 
         Returns:
             tuple: (model_engine, optimizer, _, _) from deepspeed.initialize
@@ -639,6 +700,13 @@ class Trainer(RayActor):
         learning_rate = config["learning_rate"]
         batch_size = config["batch_size"]
         autocast_enabled = config.get("autocast", True)
+
+        # If no external optimizer is provided, build parameter groups for DeepSpeed's optimizer
+        if optimizer is None:
+            optimizer_params = self._build_deepspeed_optimizer_params(model, config)
+            if optimizer_params is not None:
+                # Use parameter groups instead of flat params
+                params = optimizer_params
 
         # All-reduce happens over the data-parallel group. Track total, DP, and SP sizes separately.
         if dist.is_initialized():
@@ -663,15 +731,33 @@ class Trainer(RayActor):
             sequence_parallel_world_size = 1
             data_parallel_size = total_world_size
 
-        # Calculate global batch size (batch_size * data_parallel_size * gradient_accumulation_steps)
+        # Handle tensor parallel (AutoTP) world size for correct DP sizing
+        tp_world_size = None
+        if tensor_parallel_config and "autotp_size" in tensor_parallel_config:
+            tp_world_size = int(tensor_parallel_config["autotp_size"])
+            if tp_world_size <= 0:
+                raise ValueError(f"autotp_size must be > 0 (got {tp_world_size})")
+            if total_world_size % tp_world_size != 0:
+                raise ValueError(
+                    f"Total world size {total_world_size} must be divisible by autotp_size {tp_world_size}"
+                )
+            # AutoTP splits the remaining ranks into data parallel groups
+            data_parallel_size = max(1, total_world_size // tp_world_size)
+            if sequence_parallel_world_size > 1:
+                raise ValueError("Sequence parallelism together with AutoTP is not supported in this trainer")
+
+        # Calculate global batch size
         gradient_accumulation_steps = config["gradient_accumulation_steps"]
-        train_batch_size = batch_size * data_parallel_size * gradient_accumulation_steps
+        if tensor_parallel_config:
+            # DeepSpeed expects train_batch_size = micro_batch * grad_acc * total_world_size
+            train_batch_size = batch_size * total_world_size * gradient_accumulation_steps
+        else:
+            train_batch_size = batch_size * data_parallel_size * gradient_accumulation_steps
 
         # Get reduce_bucket_size from config
         reduce_bucket_size = config["reduce_bucket_size"]
 
         # Configure DeepSpeed fp16/bf16/autocast based on dtype and autocast setting
-        # When autocast is enabled, we use torch_autocast and disable fp16/bf16
         # When autocast is disabled, we use DeepSpeed's native fp16/bf16
         use_torch_autocast = autocast_enabled and torch_dtype != torch.float32
 
@@ -681,26 +767,35 @@ class Trainer(RayActor):
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "zero_optimization": {
                 "stage": zero_stage,
-                "allow_user_backward": True,
                 "reduce_bucket_size": reduce_bucket_size,
             },
             "fp16": {
                 "enabled": torch_dtype == torch.float16,
             },
-            "bf16": {"enabled": torch_dtype == torch.bfloat16, "bf16_master_weights_and_grads": True},
+            "bf16": {
+                "enabled": torch_dtype == torch.bfloat16,
+                "bf16_master_weights_and_grads": True,
+                "bf16_optimizer_states": True,
+            },
             "torch_autocast": {
                 "enabled": use_torch_autocast,
                 "dtype": str(torch_dtype),
             },
-            "optimizer": {
+            "zero_allow_untested_optimizer": True,
+        }
+
+        # Only add optimizer config if no external optimizer is provided
+        # When an external optimizer is passed, DeepSpeed will use it directly
+        if optimizer is None:
+            ds_config["optimizer"] = {
                 "type": "Adam",
                 "params": {
                     "lr": learning_rate,
-                    "weight_decay": config["weight_decay"],
+                    # weight_decay is handled per parameter group in model_parameters
+                    # to exclude bias/norm params, matching DTensor behavior
+                    "weight_decay": 0.0,
                 },
-            },
-            "zero_allow_untested_optimizer": True,
-        }
+            }
 
         if sequence_parallel_world_size > 1:
             ds_config.setdefault("sequence_parallel_size", sequence_parallel_world_size)
@@ -715,18 +810,29 @@ class Trainer(RayActor):
             if sequence_parallel_world_size > 1:
                 ds_config.setdefault("seq_parallel_communication_data_type", "bf16")
 
+        if tensor_parallel_config:
+            ds_config["tensor_parallel"] = tensor_parallel_config
+            ds_config.setdefault("data_parallel_size", data_parallel_size)
+
         rank = getattr(self, "rank", 0)
         if sequence_parallel_world_size > 1:
             logger.debug(
                 f"[r{rank}] DeepSpeed sequence parallel config: seq={sequence_parallel_world_size}, "
                 f"data={data_parallel_size}, total_world={total_world_size}"
             )
-        logger.debug(f"[r{rank}] Initializing DeepSpeed with ZeRO stage {zero_stage}...")
+
+        if optimizer is not None:
+            logger.debug(f"[r{rank}] Initializing DeepSpeed with external optimizer and ZeRO stage {zero_stage}...")
+        else:
+            logger.debug(f"[r{rank}] Initializing DeepSpeed with ZeRO stage {zero_stage}...")
 
         # Initialize with DeepSpeed
-        model_engine, optimizer, _, _ = deepspeed.initialize(
+        # If an external optimizer is provided, pass it to DeepSpeed
+        # Otherwise, DeepSpeed will create one based on ds_config["optimizer"]
+        model_engine, ds_optimizer, _, _ = deepspeed.initialize(
             model=model,
-            model_parameters=params,
+            optimizer=optimizer,
+            model_parameters=params if optimizer is None else None,
             config=ds_config,
             mpu=mpu,
         )
@@ -737,7 +843,10 @@ class Trainer(RayActor):
         self.use_deepspeed = True
         self.deepspeed_engine = model_engine
 
-        return model_engine, optimizer, None, None
+        # Store reference to the optimizer (either external or DeepSpeed-created)
+        self.optimizer = ds_optimizer
+
+        return model_engine, ds_optimizer, None, None
 
     # Abstract methods for model architecture (implemented by subclasses)
     @abstractmethod
@@ -824,3 +933,21 @@ class Trainer(RayActor):
             return self.model.state_dict()
         else:
             return {}
+
+    def get_memory_stats(self) -> dict:
+        """
+        Get current GPU memory statistics.
+
+        Returns:
+            dict with allocated_mb, peak_mb (max memory allocated)
+        """
+        allocated = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+        peak = torch.cuda.max_memory_allocated() / (1024 * 1024)  # MB
+        return {
+            "allocated_mb": allocated,
+            "peak_mb": peak,
+        }
+
+    def reset_peak_memory(self):
+        """Reset peak memory statistics for fresh tracking."""
+        torch.cuda.reset_peak_memory_stats()
