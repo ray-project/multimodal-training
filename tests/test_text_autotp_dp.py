@@ -75,9 +75,6 @@ def create_no_parallel_model(model_config, device, torch_dtype, seed=42):
     model.to(device=device, dtype=torch_dtype)
     lm_head.to(device=device, dtype=torch_dtype)
 
-    # Tie weights
-    lm_head.weight = model.embed_tokens.weight
-
     model.train()
     lm_head.train()
 
@@ -135,8 +132,9 @@ def create_autotp_dp_trainer(model_config, rank, autotp_size, device, torch_dtyp
     model.to(torch_dtype)
     lm_head.to(torch_dtype)
 
-    # Tie weights
-    lm_head.weight = model.embed_tokens.weight
+    # Initialize LM head with same values as embedding without tying
+    with torch.no_grad():
+        lm_head.weight.copy_(model.embed_tokens.weight)
 
     # Attach lm_head to model for DeepSpeed
     model.lm_head = lm_head
@@ -239,7 +237,7 @@ def compute_loss(model, lm_head, input_ids, labels, autocast_context=None):
         outputs = model(input_ids=input_ids)
         logits = lm_head(outputs.last_hidden_state)
 
-    shift_logits = logits[:, :-1, :].contiguous()
+    shift_logits = logits[:, :-1, :].contiguous().float()
     shift_labels = labels[:, 1:].contiguous()
 
     loss_fct = nn.CrossEntropyLoss()
@@ -401,7 +399,7 @@ def test_autotp_dp():
             outputs = autotp_trainer.model(input_ids=input_ids)
             logits = autotp_trainer.lm_head(outputs.last_hidden_state)
 
-        shift_logits = logits[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous().float()
         shift_labels = labels[:, 1:].contiguous()
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
