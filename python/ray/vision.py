@@ -436,7 +436,9 @@ class BaseVisionTrainer(Trainer):
         Args:
             iteration: Training iteration number for synchronization verification
         """
-        forward_start = time.perf_counter()
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            forward_start = time.perf_counter()
 
         # Store iteration for verification
         self._current_iteration = iteration
@@ -465,9 +467,11 @@ class BaseVisionTrainer(Trainer):
         # Call subclass-specific forward
         vision_outputs = self._model_forward(batch)
 
-        # Synchronize to get accurate timing
-        torch.cuda.synchronize()
-        forward_time_ms = (time.perf_counter() - forward_start) * 1000
+        # Synchronize and measure timing only when profiling is enabled
+        forward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            forward_time_ms = (time.perf_counter() - forward_start) * 1000
 
         # Enqueue outputs for backward pass (supports multiple outstanding microbatches)
         self._pending_outputs.append(vision_outputs)
@@ -560,14 +564,18 @@ class BaseVisionTrainer(Trainer):
 
     def backward_step(self, vision_grad_ref):
         """Run backward pass on the vision model."""
-        backward_start = time.perf_counter()
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            backward_start = time.perf_counter()
 
         vision_grad = self._retrieve_gradient_tensor(vision_grad_ref)
         self._apply_vision_backward(vision_grad)
 
-        # Synchronize to get accurate timing
-        torch.cuda.synchronize()
-        backward_time_ms = (time.perf_counter() - backward_start) * 1000
+        # Synchronize and measure timing only when profiling is enabled
+        backward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
         return {"backward_time_ms": backward_time_ms}
 

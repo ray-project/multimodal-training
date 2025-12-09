@@ -268,6 +268,7 @@ def main(cfg: DictConfig):
     warmup_steps = cfg.training.warmup_steps
     no_checkpoint = cfg.training.no_checkpoint
     log_interval = cfg.training.log_interval
+    profile_time = cfg.training.get("profile_time", False)
 
     # Get checkpoint directory and convert to absolute path
     checkpoint_dir = None
@@ -327,7 +328,7 @@ def main(cfg: DictConfig):
             text_refs = text_trainer_group.execute_all_async("forward_step", vision_refs, iteration_list)
             text_forward_results = ray.get(text_refs)
 
-            # Extract loss values and timing info
+            # Extract loss values and timing info (timing only if profiling enabled)
             loss_values = []
             text_fwd_times = []
             vision_fwd_times = []
@@ -335,8 +336,9 @@ def main(cfg: DictConfig):
                 if isinstance(result, dict):
                     loss = result.get("loss")
                     loss_values.append(loss.item() if torch.is_tensor(loss) else loss)
-                    text_fwd_times.append(result.get("forward_time_ms", 0.0))
-                    vision_fwd_times.append(result.get("vision_forward_time_ms", 0.0))
+                    if profile_time:
+                        text_fwd_times.append(result.get("forward_time_ms", 0.0))
+                        vision_fwd_times.append(result.get("vision_forward_time_ms", 0.0))
                 else:
                     # Backwards compatibility
                     loss_values.append(result.item() if torch.is_tensor(result) else result)
@@ -347,19 +349,24 @@ def main(cfg: DictConfig):
             text_backward_refs = text_trainer_group.execute_all_async("backward_step")
             vision_backward_refs = vision_trainer_group.execute_all_async("backward_step", text_backward_refs)
 
-            # Get timing from backward passes
+            # Get results from backward passes (timing only if profiling enabled)
             vision_backward_results = ray.get(vision_backward_refs)
             text_backward_results = ray.get(text_backward_refs)
 
-            # Extract backward timing
-            vision_bwd_times = [r.get("backward_time_ms", 0.0) for r in vision_backward_results if isinstance(r, dict)]
-            text_bwd_times = [r.get("backward_time_ms", 0.0) for r in text_backward_results if isinstance(r, dict)]
+            # Extract backward timing only if profiling is enabled
+            avg_vision_fwd_ms = 0.0
+            avg_vision_bwd_ms = 0.0
+            avg_text_fwd_ms = 0.0
+            avg_text_bwd_ms = 0.0
+            if profile_time:
+                vision_bwd_times = [r.get("backward_time_ms", 0.0) for r in vision_backward_results if isinstance(r, dict)]
+                text_bwd_times = [r.get("backward_time_ms", 0.0) for r in text_backward_results if isinstance(r, dict)]
 
-            # Compute average timings across actors
-            avg_vision_fwd_ms = sum(vision_fwd_times) / len(vision_fwd_times) if vision_fwd_times else 0.0
-            avg_vision_bwd_ms = sum(vision_bwd_times) / len(vision_bwd_times) if vision_bwd_times else 0.0
-            avg_text_fwd_ms = sum(text_fwd_times) / len(text_fwd_times) if text_fwd_times else 0.0
-            avg_text_bwd_ms = sum(text_bwd_times) / len(text_bwd_times) if text_bwd_times else 0.0
+                # Compute average timings across actors
+                avg_vision_fwd_ms = sum(vision_fwd_times) / len(vision_fwd_times) if vision_fwd_times else 0.0
+                avg_vision_bwd_ms = sum(vision_bwd_times) / len(vision_bwd_times) if vision_bwd_times else 0.0
+                avg_text_fwd_ms = sum(text_fwd_times) / len(text_fwd_times) if text_fwd_times else 0.0
+                avg_text_bwd_ms = sum(text_bwd_times) / len(text_bwd_times) if text_bwd_times else 0.0
 
             # Gradient clipping (if enabled)
             global_grad_norm = None
@@ -397,22 +404,25 @@ def main(cfg: DictConfig):
                     f"Vision mem: {avg_vision_alloc_mb:.0f}MB (peak {avg_vision_peak_mb:.0f}MB), "
                     f"Text mem: {avg_text_alloc_mb:.0f}MB (peak {avg_text_peak_mb:.0f}MB)"
                 )
+                # Build timing info string only if profiling is enabled
+                timing_info = ""
+                if profile_time:
+                    timing_info = (
+                        f", Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
+                        f"Text fwd: {avg_text_fwd_ms:.1f}ms, Text bwd: {avg_text_bwd_ms:.1f}ms"
+                    )
                 if measure_metrics and iteration_start is not None:
                     iter_time = time.perf_counter() - iteration_start
                     logger.info(
                         f"Epoch {epoch + 1}/{num_epochs}, Iter {iteration + 1}/{num_iterations} "
-                        f"({status}) - Loss: {avg_loss:.4f}, Iteration time: {iter_time:.3f}s, "
-                        f"Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
-                        f"Text fwd: {avg_text_fwd_ms:.1f}ms, Text bwd: {avg_text_bwd_ms:.1f}ms, "
-                        f"{mem_info}"
+                        f"({status}) - Loss: {avg_loss:.4f}, Iteration time: {iter_time:.3f}s"
+                        f"{timing_info}, {mem_info}"
                     )
                 else:
                     logger.info(
                         f"Epoch {epoch + 1}/{num_epochs}, Iter {iteration + 1}/{num_iterations} "
-                        f"({status}) - Loss: {avg_loss:.4f}, "
-                        f"Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
-                        f"Text fwd: {avg_text_fwd_ms:.1f}ms, Text bwd: {avg_text_bwd_ms:.1f}ms, "
-                        f"{mem_info}"
+                        f"({status}) - Loss: {avg_loss:.4f}"
+                        f"{timing_info}, {mem_info}"
                     )
             if iteration > 100:
                 break

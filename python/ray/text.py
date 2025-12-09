@@ -672,9 +672,11 @@ class BaseTextTrainer(Trainer):
             iteration: Training iteration number for synchronization verification
 
         Returns:
-            Dict with "loss" (scalar tensor) and "forward_time_ms" (float)
+            Dict with "loss" (scalar tensor) and optionally "forward_time_ms" (float) if profiling is enabled
         """
-        forward_start = time.perf_counter()
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            forward_start = time.perf_counter()
 
         # Store iteration for verification
         self._current_iteration = iteration
@@ -728,15 +730,15 @@ class BaseTextTrainer(Trainer):
 
         loss = self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
 
-        # Synchronize to get accurate timing
-        torch.cuda.synchronize()
-        forward_time_ms = (time.perf_counter() - forward_start) * 1000
+        # Synchronize and measure timing only when profiling is enabled
+        result = {"loss": loss}
+        if profile_time:
+            torch.cuda.synchronize()
+            forward_time_ms = (time.perf_counter() - forward_start) * 1000
+            result["forward_time_ms"] = forward_time_ms
+            result["vision_forward_time_ms"] = vision_forward_time_ms
 
-        return {
-            "loss": loss,
-            "forward_time_ms": forward_time_ms,
-            "vision_forward_time_ms": vision_forward_time_ms,
-        }
+        return result
 
     def _forward_step_impl(self, vision_embeddings, vision_sample_index=None, iteration=-1):
         """
@@ -944,9 +946,11 @@ class BaseTextTrainer(Trainer):
 
         Returns:
             Dict with "grad" (gradients w.r.t. vision embeddings or TensorTransferRequest dict)
-            and "backward_time_ms" (float).
+            and optionally "backward_time_ms" (float) if profiling is enabled.
         """
-        backward_start = time.perf_counter()
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            backward_start = time.perf_counter()
 
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} backward_step: computing gradients")
 
@@ -956,9 +960,11 @@ class BaseTextTrainer(Trainer):
         else:
             self.loss.backward()
 
-        # Synchronize to get accurate timing
-        torch.cuda.synchronize()
-        backward_time_ms = (time.perf_counter() - backward_start) * 1000
+        # Synchronize and measure timing only when profiling is enabled
+        backward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
         # Extract gradients from vision_embeddings leaf tensor
         if self.vision_embeddings is None or self.vision_embeddings.grad is None:
@@ -984,8 +990,15 @@ class BaseTextTrainer(Trainer):
         self.loss = None
         self.vision_embeddings = None
 
+        # Build result dict, conditionally including timing
+        def _build_result(grad_data):
+            result = {"grad": grad_data}
+            if profile_time:
+                result["backward_time_ms"] = backward_time_ms
+            return result
+
         if grad_to_send is None:
-            return {"grad": None, "backward_time_ms": backward_time_ms}
+            return _build_result(None)
 
         # Use CUDA IPC if configured and receiver info is available
         if self.use_ipc and self.receiver_gpu_ids is not None:
@@ -1002,10 +1015,10 @@ class BaseTextTrainer(Trainer):
             logger.debug(
                 f"[r{self.rank}] {self.__class__.__name__}: Created gradient transfer request (use_ipc={transfer_request.use_ipc})"
             )
-            return {"grad": transfer_request.to_dict(), "backward_time_ms": backward_time_ms}
+            return _build_result(transfer_request.to_dict())
         else:
             # Return gradients directly (Ray's default transport)
-            return {"grad": grad_to_send, "backward_time_ms": backward_time_ms}
+            return _build_result(grad_to_send)
 
     def zero_grad(self):
         """Zero out model and lm_head gradients to free memory."""

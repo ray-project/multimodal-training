@@ -40,9 +40,7 @@ TOKEN_CONFIGS = [
 
 # Parallelism strategies to test
 # Note: "sequence" parallelism is only valid for vision models, not text models
-# VISION_PARALLELISM_OPTIONS = ["sequence", "tensor"]
-# TEXT_PARALLELISM_OPTIONS = ["tensor", "autotp"]
-VISION_PARALLELISM_OPTIONS = ["sequence"]
+VISION_PARALLELISM_OPTIONS = ["sequence", "tensor"]
 TEXT_PARALLELISM_OPTIONS = ["tensor"]
 
 # Data parallel size options (1 = no data parallelism, >1 = replicate model across DP groups)
