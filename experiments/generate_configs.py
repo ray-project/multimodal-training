@@ -22,7 +22,7 @@ sys.path.insert(0, str(project_root))
 
 # Model settings: (model_type, model_name, tp_size, warning)
 MODEL_SETTINGS = [
-    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
+    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
     ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", 8, ""),
 ]
 
