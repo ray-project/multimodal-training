@@ -195,8 +195,13 @@ def generate_config_name(params):
     vision_dp_suffix = f"dp{vision_dp_size}" if vision_dp_size > 1 else ""
     text_dp_suffix = f"dp{text_dp_size}" if text_dp_size > 1 else ""
 
-    # Build vision parallelism string: e.g., "seq2" or "tp2" or "seq2dp2"
-    vision_par_short = "seq" if vision_par == "sequence" else "tp"
+    # Build vision parallelism string: e.g., "seq2" or "tp2" or "autotp2" or "seq2dp2"
+    if vision_par == "sequence":
+        vision_par_short = "seq"
+    elif vision_par == "autotp":
+        vision_par_short = "autotp"
+    else:
+        vision_par_short = "tp"
     vision_par_str = f"{vision_par_short}{vision_parallel_size}{vision_dp_suffix}"
 
     # Build text parallelism string: e.g., "tp2" or "autotp2" or "tp2dp2"

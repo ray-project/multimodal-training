@@ -59,6 +59,9 @@ class Trainer(RayActor):
             min_pixels=min_pixels,
             force_fixed_size=force_fixed_size,
             data_registry=data_registry,
+            num_workers=self.config["num_workers"],
+            pin_memory=self.config["pin_memory"],
+            data_flatten=self.config["data_flatten"],
         )
 
         # Get training parameters

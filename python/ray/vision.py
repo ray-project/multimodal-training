@@ -171,6 +171,14 @@ class BaseVisionTrainer(Trainer):
                 config, model_config, device, torch_dtype, load_pretrained_path=load_pretrained_path
             )
 
+        # Handle DeepSpeed AutoTP (automatic tensor parallelism)
+        if parallelism == "autotp":
+            if not dist.is_initialized():
+                init_distributed_comm(backend="nccl", use_deepspeed=True)
+            return self._build_model_with_autotp(
+                config, model_config, device, torch_dtype, load_pretrained_path=load_pretrained_path
+            )
+
         # Build model
         torch.set_default_device(device)
 
@@ -303,6 +311,106 @@ class BaseVisionTrainer(Trainer):
         )
 
         # Return the engine in place of model (projector stays separate)
+        return model_engine, projector
+
+    def _build_model_with_autotp(self, config, model_config, device, torch_dtype, load_pretrained_path=None):
+        """
+        Build model with DeepSpeed AutoTP tensor parallelism.
+
+        Args:
+            config: Training config dict
+            model_config: Model configuration
+            device: Target device
+            torch_dtype: Target dtype
+            load_pretrained_path: Optional path to pretrained checkpoint directory
+
+        Returns:
+            (model_engine, projector) tuple where model_engine is DeepSpeed engine
+        """
+        import deepspeed
+        from deepspeed.module_inject.layers import set_autotp_mode
+
+        # Enable AutoTP instrumentation before model creation
+        set_autotp_mode(training=True)
+
+        # Build model on target device
+        torch.set_default_device(device)
+        logger.debug(f"[r{self.rank}] Creating vision model for AutoTP...")
+        model, projector = self._create_model_instance(model_config)
+        torch.set_default_device("cpu")
+
+        model.to(torch_dtype)
+        if projector is not None:
+            projector.to(torch_dtype)
+
+        # Load pretrained weights BEFORE TP sharding
+        if load_pretrained_path:
+            import os
+
+            vision_checkpoint_path = os.path.join(load_pretrained_path, "vision_model.pt")
+            # Temporarily assign model for loading
+            self.model = model
+            self.load_pretrained_weights(vision_checkpoint_path)
+            model = self.model
+
+        # Apply activation checkpointing
+        activation_checkpointing = config["activation_checkpointing"]
+        self._apply_activation_checkpointing(model, activation_checkpointing, "vision model")
+
+        # Determine AutoTP size (defaults to world size if not provided)
+        world_size = dist.get_world_size()
+        autotp_size = config.get("autotp_size") or config.get("parallel_size")
+        if autotp_size is None:
+            autotp_size = world_size
+        autotp_size = int(autotp_size)
+
+        if autotp_size <= 0:
+            raise ValueError(f"autotp_size must be > 0, got {autotp_size}")
+        if autotp_size > world_size or world_size % autotp_size != 0:
+            raise ValueError(
+                f"Invalid autotp_size {autotp_size} for world size {world_size}: must divide world size"
+            )
+
+        data_parallel_size = world_size // autotp_size
+        logger.debug(
+            f"[r{self.rank}] AutoTP sizes -> tp={autotp_size}, data_parallel={data_parallel_size}, world={world_size}"
+        )
+
+        # Count parameters before TP sharding for logging
+        params_before_tp = sum(p.numel() for p in model.parameters())
+        logger.debug(f"[r{self.rank}] Parameters BEFORE TP sharding: {params_before_tp:,}")
+
+        # Apply tensor parallelism with deepspeed.tp_model_init()
+        logger.debug(f"[r{self.rank}] Applying TP sharding with deepspeed.tp_model_init (tp_size={autotp_size})...")
+        model = deepspeed.tp_model_init(model, tp_size=autotp_size, dtype=torch_dtype)
+
+        # Count parameters after TP sharding
+        params_after_tp = sum(p.numel() for p in model.parameters())
+        reduction_pct = 100 * (params_before_tp - params_after_tp) / params_before_tp if params_before_tp > 0 else 0
+        logger.debug(f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)")
+
+        # Collect parameters after TP sharding (shapes have changed)
+        params = self._collect_parameters_from_modules(model, projector)
+
+        # Create the optimizer externally to ensure consistency with other paths
+        self._build_optimizer(params)
+        external_optimizer = self.optimizer
+
+        tp_overlap_comm = config.get("tp_overlap_comm", None)
+        tensor_parallel_cfg = {"autotp_size": autotp_size}
+        if tp_overlap_comm is not None:
+            tensor_parallel_cfg["tp_overlap_comm"] = bool(tp_overlap_comm)
+
+        # Initialize DeepSpeed with AutoTP configuration and external optimizer
+        model_engine, optimizer, _, _ = self._initialize_deepspeed(
+            model=model,
+            params=params,
+            config=config,
+            torch_dtype=torch_dtype,
+            tensor_parallel_config=tensor_parallel_cfg,
+            optimizer=external_optimizer,
+        )
+
         return model_engine, projector
 
     def _configure_sequence_parallel_mode(self, model_config, enabled):
