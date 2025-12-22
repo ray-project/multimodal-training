@@ -82,6 +82,9 @@ Note: TP/SP sizes are now configured separately via `VISION_PARALLEL_SIZE_OPTION
 - Vision: sequence, tensor
 - Text: tensor, autotp (DeepSpeed AutoTP)
 
+**Important: AutoTP Limitations:**
+- AutoTP is **not compatible with ZeRO stage 3**. When using `text.parallelism: "autotp"`, you must set `text.zero_stage` to 1 or 2.
+
 **Per-Model Parallelism Configuration:**
 
 Each model (vision and text) can have its own parallelism settings:
@@ -210,3 +213,23 @@ Examples:
 - `vseq8_ttp8` - Vision: SP=8, Text: TP=8, no data parallel
 - `vseq2dp2_ttp2dp2` - Vision: SP=2 with DP=2, Text: TP=2 with DP=2
 - `vtp4_tautotp4dp2` - Vision: TP=4, Text: AutoTP=4 with DP=2
+
+## Sample Configuration Files
+
+The following sample configs are provided in the `configs/` directory for quick testing:
+
+| Config File | Vision | Text | Total GPUs |
+|-------------|--------|------|------------|
+| `sample.yaml` | Sequence Parallel (SP=8) | Tensor Parallel (TP=8) | 8 |
+| `sample_dp2_vision_sequence_text_autotp.yaml` | Sequence Parallel (DP=2, SP=4) | AutoTP (DP=2, TP=4) | 8 |
+| `sample_dp2_vision_tensor_text_autotp.yaml` | Tensor Parallel (DP=2, TP=4) | AutoTP (DP=2, TP=4) | 8 |
+| `sample_dp2_vision_tensor_text_tensor.yaml` | Tensor Parallel (DP=2, TP=4) | Tensor Parallel (DP=2, TP=4) | 8 |
+
+**Usage:**
+```bash
+# Run with sample config
+python -m python.train_ray --config-path=../configs --config-name=sample
+
+# Run with DP=2 config
+python -m python.train_ray --config-path=../configs --config-name=sample_dp2_vision_sequence_text_autotp
+```

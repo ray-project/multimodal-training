@@ -57,9 +57,11 @@ VISION_PARALLEL_SIZE_OPTIONS = [4]  # TP/SP size for vision model
 TEXT_PARALLEL_SIZE_OPTIONS = [4]  # TP size for text model (must match VISION_PARALLEL_SIZE_OPTIONS)
 
 
-# DeepSpeed ZeRO stage (only used when parallelism is "deepspeed")
+# DeepSpeed ZeRO stage
+# NOTE: AutoTP (text.parallelism="autotp") is NOT compatible with ZeRO stage 3.
+#       When using AutoTP, you must use zero_stage 1 or 2.
 VISION_ZERO_STAGE_OPTIONS = [1]
-TEXT_ZERO_STAGE_OPTIONS = [3]
+TEXT_ZERO_STAGE_OPTIONS = [3]  # Change to [1] or [2] if using TEXT_PARALLELISM_OPTIONS = ["autotp"]
 
 # Attention backends
 # ATTENTION_BACKENDS = ["sdpa", "flash_attention_2"]

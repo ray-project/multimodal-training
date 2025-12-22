@@ -3,34 +3,34 @@ debug: false
 # Vision model configuration
 vision:
   model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
-  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
-  parallelism: "sequence"  # Options: "none", "tensor", "sequence", "deepspeed"
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"  # Path to pretrained model
+  parallelism: "tensor"  # Options: "none", "tensor", "sequence", "deepspeed"
   dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
   attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
   activation_checkpointing: true
   autocast: true  # Enable torch autocast for mixed precision
   zero_stage: 1  # DeepSpeed ZeRO stage (1, 2, or 3)
-  dp_size: 1  # Data parallel size for vision model
-  parallel_size: 8  # SP size per DP replica for vision model
+  dp_size: 2  # Data parallel size for vision model
+  parallel_size: 4  # TP size per DP replica for vision model
 
 # Text model configuration
 text:
   model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
-  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"  # Path to pretrained model
   parallelism: "tensor"  # Options: "none", "tensor", "deepspeed", "autotp"
   dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
   attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
   activation_checkpointing: true
   autocast: true  # Enable torch autocast for mixed precision
-  zero_stage: 3  # DeepSpeed ZeRO stage (1, 2, or 3) - Note: AutoTP requires stage 1 or 2
-  autotp_size: null  # Optional tensor parallel size when using AutoTP (defaults to parallel_size)
+  zero_stage: 3  # DeepSpeed ZeRO stage (1, 2, or 3)
+  autotp_size: null  # Optional tensor parallel size when using AutoTP (not used for tensor parallelism)
   tp_overlap_comm: false  # Enable TP communication overlap for AutoTP if supported
-  dp_size: 1  # Data parallel size for text model
-  parallel_size: 8  # TP size per DP replica for text model
+  dp_size: 2  # Data parallel size for text model
+  parallel_size: 4  # TP size per DP replica for text model
 
 # Training configuration
 training:
-  batch_size: 4
+  batch_size: 1
   learning_rate: 5e-05
   num_epochs: 1  # Number of training epochs
   num_iterations: 20  # Number of iterations (batches) per epoch
@@ -41,7 +41,7 @@ training:
   gradient_accumulation_steps: 1
   seed: 42
   dp_size: 1  # Legacy: use vision.dp_size and text.dp_size instead
-  parallel_size: 8  # Legacy: use vision.parallel_size and text.parallel_size instead
+  parallel_size: 4  # Legacy: use vision.parallel_size and text.parallel_size instead
   collocate: true  # Whether to collocate vision and text models on same GPUs
   clip_grad_norm: false  # Enable gradient clipping
   max_grad_norm: 1.0  # Maximum gradient norm (e.g., 1.0)
@@ -60,13 +60,13 @@ data:
     mscoco2017_val_captions:
       annotation_path: "/dev/shm/datasets/mscoco2017/annotations/coco2017_val_qwen.json"
       data_path: "/dev/shm/datasets/mscoco2017"
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   data_flatten: true
-  min_pixels: 802816
-  max_pixels: 802816
-  force_fixed_size: false  # Force all images to fixed size (sqrt(max_pixels) x sqrt(max_pixels)) for benchmarking
+  min_pixels: 200704
+  max_pixels: 200704
+  force_fixed_size: true  # Force all images to fixed size (sqrt(max_pixels) x sqrt(max_pixels))
 
 # DeepSpeed configuration
 deepspeed:
-  reduce_bucket_size: 500000000  # Number of elements in gradient reduction bucket (500M or 100M for 64k_tokens)
+  reduce_bucket_size: 500000000  # Number of elements in gradient reduction bucket
