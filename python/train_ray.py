@@ -164,10 +164,12 @@ def main(cfg: DictConfig):
         text_config.update(dict(cfg.deepspeed))
 
     # Get per-model parallelism configuration
+    # Fall back to training.parallel_size if per-model parallel_size is not specified
+    default_parallel_size = cfg.training.get("parallel_size", 8)
     vision_dp_size = cfg.vision.get("dp_size", 1)
-    vision_parallel_size = cfg.vision.get("parallel_size", 1)
+    vision_parallel_size = cfg.vision.get("parallel_size", default_parallel_size)
     text_dp_size = cfg.text.get("dp_size", 1)
-    text_parallel_size = cfg.text.get("parallel_size", 1)
+    text_parallel_size = cfg.text.get("parallel_size", default_parallel_size)
 
     # Validate: vision and text parallel_size must be the same (required for actor coordination)
     if vision_parallel_size != text_parallel_size:

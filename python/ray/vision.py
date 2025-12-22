@@ -201,8 +201,20 @@ class BaseVisionTrainer(Trainer):
             init_distributed_comm(backend="nccl")
             assert dist.is_initialized(), "Failed to initialize distributed communication for tensor parallelism"
 
-            tp_world_size = dist.get_world_size()
-            tp_mesh = init_device_mesh("cuda", (tp_world_size,))
+            world_size = dist.get_world_size()
+            # Get tensor parallel size from config, default to world_size for backward compatibility
+            tp_world_size = config.get("parallel_size", world_size)
+            dp_size = world_size // tp_world_size
+
+            # Create appropriate device mesh based on whether we have data parallelism
+            if dp_size > 1:
+                # Create 2D mesh for (DP, TP)
+                logger.debug(f"[r{self.rank}] Creating 2D device mesh: (DP={dp_size}, TP={tp_world_size})")
+                full_mesh = init_device_mesh("cuda", (dp_size, tp_world_size), mesh_dim_names=("dp", "tp"))
+                tp_mesh = full_mesh["tp"]
+            else:
+                # Create 1D mesh for TP only
+                tp_mesh = init_device_mesh("cuda", (tp_world_size,))
 
             logger.debug(f"[r{self.rank}] Applying tensor parallelism...")
 
