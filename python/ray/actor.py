@@ -2,11 +2,18 @@ import os
 from dataclasses import dataclass
 
 import ray
-from ray.air._internal.util import find_free_port
 
 from .logger import setup_logging
 from .utils import get_physical_gpu_id
 
+import socket
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+    
 
 @dataclass
 class TorchDistributedConfig:

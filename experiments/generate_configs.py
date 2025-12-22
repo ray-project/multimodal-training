@@ -20,10 +20,10 @@ from jinja2 import Template
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# Model settings: (model_type, model_name, tp_size, warning)
+# Model settings: (model_type, model_name, warning)
 MODEL_SETTINGS = [
-    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
-    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", 8, ""),
+    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", ""),
+    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", ""),
 ]
 
 # Token configurations: (label, max_pixels, min_pixels)
@@ -31,21 +31,31 @@ MODEL_SETTINGS = [
 # All values ensure num_windows % 8 == 0 for sequence parallelism compatibility
 TOKEN_CONFIGS = [
     ("1k_tokens", 200704, 200704),  # sqrt=448, 1024 vision tokens (closest to 1k)
-    ("4k_tokens", 802816, 802816),  # sqrt=896, 4096 vision tokens (exact)
-    ("8k_tokens", 1806336, 1806336),  # sqrt=1344, 9216 vision tokens (closest to 8k)
-    ("16k_tokens", 3211264, 3211264),  # sqrt=1792, 16384 vision tokens (closest to 16k)
-    ("32k_tokens", 5017600, 5017600),  # sqrt=2240, 25600 vision tokens (closest to 32k)
-    ("64k_tokens", 12845056, 12845056),  # sqrt=3584, 65536 vision tokens (closest to 64k)
+    # ("4k_tokens", 802816, 802816),  # sqrt=896, 4096 vision tokens (exact)
+    # ("8k_tokens", 1806336, 1806336),  # sqrt=1344, 9216 vision tokens (closest to 8k)
+    # ("16k_tokens", 3211264, 3211264),  # sqrt=1792, 16384 vision tokens (closest to 16k)
+    # ("32k_tokens", 5017600, 5017600),  # sqrt=2240, 25600 vision tokens (closest to 32k)
+    # ("64k_tokens", 12845056, 12845056),  # sqrt=3584, 65536 vision tokens (closest to 64k)
 ]
 
 # Parallelism strategies to test
 # Note: "sequence" parallelism is only valid for vision models, not text models
-VISION_PARALLELISM_OPTIONS = ["sequence", "tensor"]
+VISION_PARALLELISM_OPTIONS = ["sequence"]
 TEXT_PARALLELISM_OPTIONS = ["tensor"]
 
 # Data parallel size options (1 = no data parallelism, >1 = replicate model across DP groups)
-# Total GPUs = dp_size * parallel_size
-DP_SIZE_OPTIONS = [1]
+# Vision: total GPUs = vision_dp_size * vision_parallel_size
+# Text: total GPUs = text_dp_size * text_parallel_size
+VISION_DP_SIZE_OPTIONS = [2]  # Data parallel size for vision model
+TEXT_DP_SIZE_OPTIONS = [2]  # Data parallel size for text model
+
+# TP/SP size options per DP replica
+# Vision: sequence parallel or tensor parallel size
+# Text: tensor parallel size
+# NOTE: vision and text parallel_size must be the same (required by training code)
+VISION_PARALLEL_SIZE_OPTIONS = [4]  # TP/SP size for vision model
+TEXT_PARALLEL_SIZE_OPTIONS = [4]  # TP size for text model (must match VISION_PARALLEL_SIZE_OPTIONS)
+
 
 # DeepSpeed ZeRO stage (only used when parallelism is "deepspeed")
 VISION_ZERO_STAGE_OPTIONS = [1]
@@ -171,12 +181,27 @@ def generate_config_name(params):
     ckpt_val = params["vision_activation_checkpointing"]
     ckpt = "ckpt" if (ckpt_val == "true" or ckpt_val is True) else "nockpt"
     dtype = params["vision_dtype"]
-    dp_size = params["dp_size"]
 
-    # Include dp_size in name only if not 1 (to maintain backward compatibility)
-    dp_suffix = f"_dp{dp_size}" if dp_size > 1 else ""
+    # Get per-model dp_size and parallel_size
+    vision_dp_size = params["vision_dp_size"]
+    text_dp_size = params["text_dp_size"]
+    vision_parallel_size = params["vision_parallel_size"]
+    text_parallel_size = params["text_parallel_size"]
 
-    return f"{model_name}_vpar{vision_par}_tpar{text_par}_{token_label}_bs{batch_size}_{attn}_{ckpt}_{dtype}{dp_suffix}"
+    # Build parallelism suffix with dp and tp/sp sizes
+    # Format: vpar{type}{tp_size}[_dp{dp}] for vision, tpar{type}{tp_size}[_dp{dp}] for text
+    vision_dp_suffix = f"dp{vision_dp_size}" if vision_dp_size > 1 else ""
+    text_dp_suffix = f"dp{text_dp_size}" if text_dp_size > 1 else ""
+
+    # Build vision parallelism string: e.g., "seq2" or "tp2" or "seq2dp2"
+    vision_par_short = "seq" if vision_par == "sequence" else "tp"
+    vision_par_str = f"{vision_par_short}{vision_parallel_size}{vision_dp_suffix}"
+
+    # Build text parallelism string: e.g., "tp2" or "autotp2" or "tp2dp2"
+    text_par_short = "autotp" if text_par == "autotp" else "tp"
+    text_par_str = f"{text_par_short}{text_parallel_size}{text_dp_suffix}"
+
+    return f"{model_name}_v{vision_par_str}_t{text_par_str}_{token_label}_bs{batch_size}_{attn}_{ckpt}_{dtype}"
 
 
 def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
@@ -203,7 +228,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
 
     # Generate all combinations
     for (
-        (model_type, model_name, tp_size, warning),
+        (model_type, model_name, warning),
         (token_label, max_pixels, min_pixels),
         vision_par,
         text_par,
@@ -214,7 +239,10 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
         dtype,
         vision_zero_stage,
         text_zero_stage,
-        dp_size,
+        vision_dp_size,
+        text_dp_size,
+        vision_parallel_size,
+        text_parallel_size,
     ) in product(
         MODEL_SETTINGS,
         TOKEN_CONFIGS,
@@ -227,8 +255,18 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
         DTYPE_OPTIONS,
         VISION_ZERO_STAGE_OPTIONS,
         TEXT_ZERO_STAGE_OPTIONS,
-        DP_SIZE_OPTIONS,
+        VISION_DP_SIZE_OPTIONS,
+        TEXT_DP_SIZE_OPTIONS,
+        VISION_PARALLEL_SIZE_OPTIONS,
+        TEXT_PARALLEL_SIZE_OPTIONS,
     ):
+
+        # Validate: vision and text parallel_size must be the same (required by training code)
+        if vision_parallel_size != text_parallel_size:
+            raise ValueError(
+                f"vision_parallel_size ({vision_parallel_size}) must equal text_parallel_size ({text_parallel_size}). "
+                "The training code requires both models to use the same TP/SP size."
+            )
 
         # Determine reduce_bucket_size based on token configuration
         # For 64k_tokens (12845056 pixels), use 100M elements; otherwise use 500M
@@ -245,6 +283,8 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "vision_activation_checkpointing": str(act_ckpt).lower(),
             "vision_autocast": str(autocast).lower(),
             "vision_zero_stage": vision_zero_stage,
+            "vision_dp_size": vision_dp_size,  # Data parallel size for vision
+            "vision_parallel_size": vision_parallel_size,  # TP/SP size for vision
             # Text model (same as vision for now)
             "text_model_type": model_type,
             "text_model_name": model_name,
@@ -256,6 +296,8 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "text_zero_stage": text_zero_stage,
             "text_autotp_size": DEFAULT_AUTOTP["autotp_size"],
             "text_tp_overlap_comm": DEFAULT_AUTOTP["tp_overlap_comm"],
+            "text_dp_size": text_dp_size,  # Data parallel size for text
+            "text_parallel_size": text_parallel_size,  # TP size for text
             # Training
             "batch_size": batch_size,
             "learning_rate": DEFAULT_TRAINING["learning_rate"],
@@ -267,8 +309,6 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "weight_decay": DEFAULT_TRAINING["weight_decay"],
             "gradient_accumulation_steps": DEFAULT_TRAINING["gradient_accumulation_steps"],
             "seed": DEFAULT_TRAINING["seed"],
-            "dp_size": dp_size,  # Data parallel size
-            "parallel_size": tp_size,  # TP/SP size per DP replica
             "collocate": str(DEFAULT_TRAINING["collocate"]).lower(),
             "clip_grad_norm": str(DEFAULT_TRAINING["clip_grad_norm"]).lower(),
             "max_grad_norm": DEFAULT_TRAINING["max_grad_norm"],
@@ -306,7 +346,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             {
                 "name": config_name,
                 "file": str(config_file),
-                "tp_size": tp_size,
+                "parallel_size": vision_parallel_size,  # TP/SP size (vision and text must be equal)
                 "warning": warning,
             }
         )
@@ -320,7 +360,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
     manifest_path = output_path / "manifest.txt"
     with open(manifest_path, "w") as f:
         for cfg in configs:
-            f.write(f"{cfg['name']}\t{cfg['file']}\t{cfg['tp_size']}\t{cfg['warning']}\n")
+            f.write(f"{cfg['name']}\t{cfg['file']}\t{cfg['parallel_size']}\t{cfg['warning']}\n")
 
     print(f"Manifest written to {manifest_path}")
 

@@ -10,6 +10,8 @@ vision:
   activation_checkpointing: {{ vision_activation_checkpointing }}
   autocast: {{ vision_autocast }}  # Enable torch autocast for mixed precision
   zero_stage: {{ vision_zero_stage }}  # DeepSpeed ZeRO stage (1, 2, or 3)
+  dp_size: {{ vision_dp_size }}  # Data parallel size for vision model
+  parallel_size: {{ vision_parallel_size }}  # TP/SP size per DP replica for vision model
 
 # Text model configuration
 text:
@@ -23,6 +25,8 @@ text:
   zero_stage: {{ text_zero_stage }}  # DeepSpeed ZeRO stage (1, 2, or 3)
   autotp_size: {{ text_autotp_size }}  # Optional tensor parallel size when using AutoTP (set automatically based on parallel_size)
   tp_overlap_comm: {{ text_tp_overlap_comm }}  # Enable TP communication overlap for AutoTP if supported
+  dp_size: {{ text_dp_size }}  # Data parallel size for text model
+  parallel_size: {{ text_parallel_size }}  # TP size per DP replica for text model
 
 # Training configuration
 training:
@@ -36,8 +40,6 @@ training:
   weight_decay: {{ weight_decay }}  # L2 regularization strength (weight decay)
   gradient_accumulation_steps: {{ gradient_accumulation_steps }}
   seed: {{ seed }}
-  dp_size: {{ dp_size }}  # Data parallel size (number of DP replicas)
-  parallel_size: {{ parallel_size }}  # TP/SP size per DP replica (total GPUs = dp_size * parallel_size)
   collocate: {{ collocate }}  # Whether to collocate vision and text models on same GPUs
   clip_grad_norm: {{ clip_grad_norm }}  # Enable gradient clipping
   max_grad_norm: {{ max_grad_norm }}  # Maximum gradient norm (e.g., 1.0)

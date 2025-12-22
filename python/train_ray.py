@@ -163,28 +163,52 @@ def main(cfg: DictConfig):
         vision_config.update(dict(cfg.deepspeed))
         text_config.update(dict(cfg.deepspeed))
 
-    # Add DP/TP configuration for proper parallelism setup
-    dp_size = cfg.training.get("dp_size", 1)
-    parallel_size = cfg.training.parallel_size  # TP/SP size per DP replica
+    # Get per-model parallelism configuration
+    vision_dp_size = cfg.vision.get("dp_size", 1)
+    vision_parallel_size = cfg.vision.get("parallel_size", 1)
+    text_dp_size = cfg.text.get("dp_size", 1)
+    text_parallel_size = cfg.text.get("parallel_size", 1)
 
-    # For vision with sequence parallel, set sequence_parallel_size (not world_size)
+    # Validate: vision and text parallel_size must be the same (required for actor coordination)
+    if vision_parallel_size != text_parallel_size:
+        raise ValueError(
+            f"vision.parallel_size ({vision_parallel_size}) must equal text.parallel_size ({text_parallel_size}). "
+            "The training code requires both models to use the same TP/SP size."
+        )
+
+    # Use common parallel_size (validated to be equal)
+    parallel_size = vision_parallel_size
+
+    # For vision with sequence parallel, set sequence_parallel_size
     vision_config["sequence_parallel_size"] = parallel_size
 
-    # For text with AutoTP, autotp_size should be parallel_size (not world_size)
+    # For text with AutoTP, autotp_size should be parallel_size
     # If autotp_size is explicitly set in config, respect it; otherwise use parallel_size
     if text_config.get("parallelism") == "autotp" and text_config.get("autotp_size") is None:
         text_config["autotp_size"] = parallel_size
 
-    # Get number of actors and collocation setting from config
-    parallel_size = cfg.training.parallel_size  # TP/SP size per DP replica
-    dp_size = cfg.training.get("dp_size", 1)  # Data parallel size (default: 1)
+    # Get collocation setting from config
     collocate = cfg.training.collocate
 
     # Calculate total actors needed: dp_size * parallel_size
     # Each DP replica has parallel_size actors
-    total_actors = dp_size * parallel_size
+    # Note: vision and text can have different dp_size, but we use the max for actor allocation
+    vision_total_actors = vision_dp_size * parallel_size
+    text_total_actors = text_dp_size * parallel_size
 
-    logger.info(f"Data Parallel size: {dp_size}, TP/SP size per replica: {parallel_size}")
+    # For now, require same total actors for vision and text (same dp_size)
+    if vision_total_actors != text_total_actors:
+        raise ValueError(
+            f"Vision total actors ({vision_total_actors} = {vision_dp_size} × {parallel_size}) must equal "
+            f"text total actors ({text_total_actors} = {text_dp_size} × {parallel_size}). "
+            "Different dp_size for vision and text is not yet supported."
+        )
+
+    total_actors = vision_total_actors
+    dp_size = vision_dp_size  # Use vision's dp_size (validated to match text's)
+
+    logger.info(f"Vision: DP size={vision_dp_size}, TP/SP size={parallel_size}")
+    logger.info(f"Text: DP size={text_dp_size}, TP/SP size={parallel_size}")
     logger.info(f"Creating {total_actors} total actors ({dp_size} DP replicas × {parallel_size} actors/replica)")
     logger.info(f"Collocation enabled: {collocate}")
 

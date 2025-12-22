@@ -65,8 +65,10 @@ This will generate:
 The script generates configs by combining these parameters:
 
 **Model Settings:**
-- Qwen2.5-VL-7B-Instruct (TP=4)
-- Qwen2.5-VL-32B-Instruct (TP=8)
+- Qwen2.5-VL-7B-Instruct
+- Qwen2.5-VL-32B-Instruct
+
+Note: TP/SP sizes are now configured separately via `VISION_PARALLEL_SIZE_OPTIONS` and `TEXT_PARALLEL_SIZE_OPTIONS`.
 
 **Vision Token Configurations:**
 - 1k tokens (448x448 px)
@@ -80,9 +82,29 @@ The script generates configs by combining these parameters:
 - Vision: sequence, tensor
 - Text: tensor, autotp (DeepSpeed AutoTP)
 
-**Data Parallelism:**
-- dp_size: 1 (default, no data parallelism)
-- Total GPUs = dp_size × parallel_size
+**Per-Model Parallelism Configuration:**
+
+Each model (vision and text) can have its own parallelism settings:
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `vision.dp_size` | Data parallel size for vision model | 1 |
+| `vision.parallel_size` | TP/SP size per DP replica for vision | 8 |
+| `text.dp_size` | Data parallel size for text model | 1 |
+| `text.parallel_size` | TP size per DP replica for text | 8 |
+
+**Important Constraints:**
+- `vision.parallel_size` must equal `text.parallel_size` (required by training code)
+- Total GPUs for vision = `vision.dp_size` × `vision.parallel_size`
+- Total GPUs for text = `text.dp_size` × `text.parallel_size`
+
+**Configuration Options in `generate_configs.py`:**
+```python
+VISION_DP_SIZE_OPTIONS = [1]        # Data parallel size for vision
+TEXT_DP_SIZE_OPTIONS = [1]          # Data parallel size for text
+VISION_PARALLEL_SIZE_OPTIONS = [8]  # TP/SP size for vision
+TEXT_PARALLEL_SIZE_OPTIONS = [8]    # TP size for text (must match vision)
+```
 
 **Batch Sizes:** 1, 2, 4, 8
 
@@ -132,8 +154,8 @@ To run only specific configs, edit `run_sweep.sh` and modify the `CONFIGS` array
 # Manually specify configs to run (format: "config_name:skip_flag")
 # skip_flag: 0=run, 1=skip
 CONFIGS=(
-    "Qwen_Qwen2_5-VL-7B-Instruct_vparsequence_tpartensor_4k_tokens_bs4_flash_attention_2_ckpt_bfloat16:0"
-    "Qwen_Qwen2_5-VL-7B-Instruct_vpartensor_tpartensor_4k_tokens_bs4_flash_attention_2_ckpt_bfloat16:0"
+    "Qwen_Qwen2_5-VL-7B-Instruct_vseq8_ttp8_4k_tokens_bs4_flash_attention_2_ckpt_bfloat16:0"
+    "Qwen_Qwen2_5-VL-7B-Instruct_vseq2dp2_ttp2dp2_4k_tokens_bs4_flash_attention_2_ckpt_bfloat16:0"
 )
 ```
 
@@ -167,6 +189,24 @@ Example summary output:
 ```
 Configuration                                                        | Status     | Avg Iter Time (s)    | Iters/Sec
 -----------------------------------------------------------------------------------------
-model_name_vparseq_tpartensor_4k_tokens_bs4...                      | SUCCESS    | 2.345                | 0.4264
-model_name_vpartensor_tpartensor_4k_tokens_bs4...                   | SUCCESS    | 2.567                | 0.3896
+Qwen_Qwen2_5-VL-7B-Instruct_vseq8_ttp8_4k_tokens_bs4...             | SUCCESS    | 2.345                | 0.4264
+Qwen_Qwen2_5-VL-7B-Instruct_vseq2dp2_ttp2dp2_4k_tokens_bs4...       | SUCCESS    | 2.567                | 0.3896
 ```
+
+### Config Naming Convention
+
+Config names follow this pattern:
+```
+{model_name}_v{vision_par}{vision_tp}[dp{vision_dp}]_t{text_par}{text_tp}[dp{text_dp}]_{tokens}_bs{batch}_{attn}_{ckpt}_{dtype}
+```
+
+Where:
+- `vision_par`: `seq` (sequence parallel) or `tp` (tensor parallel)
+- `text_par`: `tp` (tensor parallel) or `autotp` (DeepSpeed AutoTP)
+- `vision_tp`/`text_tp`: TP/SP size (e.g., `2`, `8`)
+- `dp{N}`: Data parallel size (omitted if dp_size=1)
+
+Examples:
+- `vseq8_ttp8` - Vision: SP=8, Text: TP=8, no data parallel
+- `vseq2dp2_ttp2dp2` - Vision: SP=2 with DP=2, Text: TP=2 with DP=2
+- `vtp4_tautotp4dp2` - Vision: TP=4, Text: AutoTP=4 with DP=2
