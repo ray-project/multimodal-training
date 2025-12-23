@@ -540,6 +540,10 @@ class BaseVisionTrainer(Trainer):
         logger.debug(
             f"[r{self.rank}] {self.__class__.__name__} initialized with {dataset_len} samples, batch_size={batch_size}"
         )
+
+        # Set up profilers for forward/backward
+        self._setup_profilers("vision")
+
         super().initialize_trainer()
 
     def set_receiver_info(self, receiver_gpu_ids: list[str], use_ipc: bool):
@@ -563,12 +567,18 @@ class BaseVisionTrainer(Trainer):
         # Store iteration for verification
         self._current_iteration = iteration
 
-        # Get next batch
+        # Get next batch (with optional timing)
+        if profile_time:
+            data_load_start = time.perf_counter()
+
         try:
             batch = next(self.data_iterator)
         except StopIteration:
             self.data_iterator = iter(self.dataloader)
             batch = next(self.data_iterator)
+
+        if profile_time:
+            data_load_time_ms = (time.perf_counter() - data_load_start) * 1000
 
         logger.debug(f"[r{self.rank}] Vision forward_step: iteration={iteration}")
 
@@ -602,6 +612,7 @@ class BaseVisionTrainer(Trainer):
             "sample_index": sample_index,
             "iteration": iteration,
             "forward_time_ms": forward_time_ms,
+            "data_load_time_ms": data_load_time_ms if profile_time else 0.0,
         }
 
         # Use CUDA IPC if configured
@@ -615,9 +626,11 @@ class BaseVisionTrainer(Trainer):
             )
             # Wrap transfer request with metadata
             result["vision_embeddings"] = transfer_request.to_dict()
-            return result
-        else:
-            return result
+
+        # Step the forward profiler
+        self._step_forward_profiler()
+
+        return result
 
     def _retrieve_gradient_tensor(self, vision_grad_ref):
         """Retrieve gradient tensor from Ray reference or transfer request."""
@@ -696,6 +709,9 @@ class BaseVisionTrainer(Trainer):
         if profile_time:
             torch.cuda.synchronize()
             backward_time_ms = (time.perf_counter() - backward_start) * 1000
+
+        # Step the backward profiler
+        self._step_backward_profiler()
 
         return {"backward_time_ms": backward_time_ms}
 

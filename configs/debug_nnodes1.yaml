@@ -1,0 +1,80 @@
+debug: false
+
+# Vision model configuration
+vision:
+  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
+  parallelism: "tensor"  # Options: "none", "tensor", "sequence", "deepspeed"
+  dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
+  attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
+  activation_checkpointing: true
+  autocast: true  # Enable torch autocast for mixed precision
+  zero_stage: 1  # DeepSpeed ZeRO stage (1, 2, or 3)
+  dp_size: 1  # Data parallel size for vision model
+  parallel_size: 8  # TP/SP size per DP replica for vision model
+
+# Text model configuration
+text:
+  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
+  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed", "autotp"
+  dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
+  attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
+  activation_checkpointing: true
+  autocast: true  # Enable torch autocast for mixed precision
+  zero_stage: 1  # DeepSpeed ZeRO stage (1, 2, or 3)
+  autotp_size: null  # Optional tensor parallel size when using AutoTP (set automatically based on parallel_size)
+  tp_overlap_comm: false  # Enable TP communication overlap for AutoTP if supported
+  dp_size: 1  # Data parallel size for text model
+  parallel_size: 8  # TP size per DP replica for text model
+
+# Training configuration
+training:
+  batch_size: 8
+  learning_rate: 5e-05
+  num_epochs: 1  # Number of training epochs
+  num_iterations: 20  # Number of iterations (batches) per epoch
+  warmup_steps: 10
+  warmup_ratio: 0.03  # Proportion of training steps for LR warmup (takes precedence over warmup_steps if > 0)
+  lr_scheduler_type: "cosine"  # Learning rate scheduler: "cosine", "linear", "constant", etc.
+  weight_decay: 0.01  # L2 regularization strength (weight decay)
+  gradient_accumulation_steps: 1
+  seed: 42
+  collocate: true  # Whether to collocate vision and text models on same GPUs
+  clip_grad_norm: false  # Enable gradient clipping
+  max_grad_norm: 1.0  # Maximum gradient norm (e.g., 1.0)
+  no_checkpoint: true  # Disable checkpointing (default: false)
+  checkpoint_dir: "/tmp/checkpoints"  # Directory to save/load checkpoints (only used if no_checkpoint=false)
+  log_interval: 1  # Log training progress every N iterations
+  profile_time: true
+  enable_profiler: true
+  profile_dir: "/dev/shm/profile/debug_nnodes1_nstep1"
+  profile_steps: 1  # Number of steps to actively profile
+
+# Data configuration
+data:
+  datasets:
+    - mscoco2017_train_captions
+  data_registry:
+    mscoco2017_train_captions:
+      annotation_path: "/dev/shm/datasets/mscoco2017/annotations/coco2017_train_qwen.json"
+      data_path: "/dev/shm/datasets/mscoco2017"
+    mscoco2017_val_captions:
+      annotation_path: "/dev/shm/datasets/mscoco2017/annotations/coco2017_val_qwen.json"
+      data_path: "/dev/shm/datasets/mscoco2017"
+    laion_pop_train:
+      annotation_path: "__PATH_TO_LAION_POP__/laion_pop_train.jsonl"
+      data_path: "__PATH_TO_LAION_POP__/images"
+    laion_pop_val:
+      annotation_path: "__PATH_TO_LAION_POP__/laion_pop_val.jsonl"
+      data_path: "__PATH_TO_LAION_POP__/images"
+  num_workers: 4
+  pin_memory: true
+  data_flatten: true
+  min_pixels: 1806336
+  max_pixels: 1806336
+  force_fixed_size: true  # Force all images to fixed size (sqrt(max_pixels) x sqrt(max_pixels))
+
+# DeepSpeed configuration
+deepspeed:
+  reduce_bucket_size: 500000000  # Number of elements in gradient reduction bucket (500M or 100M for 64k_tokens)

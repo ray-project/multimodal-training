@@ -301,8 +301,6 @@ def main(cfg: DictConfig):
     if not no_checkpoint:
         checkpoint_dir = cfg.training.checkpoint_dir
         if checkpoint_dir:
-            import os
-
             checkpoint_dir = os.path.abspath(checkpoint_dir)
             logger.info(f"Checkpointing enabled. Directory (absolute): {checkpoint_dir}")
     else:
@@ -358,6 +356,7 @@ def main(cfg: DictConfig):
             loss_values = []
             text_fwd_times = []
             vision_fwd_times = []
+            vision_data_load_times = []
             for result in text_forward_results:
                 if isinstance(result, dict):
                     loss = result.get("loss")
@@ -365,6 +364,7 @@ def main(cfg: DictConfig):
                     if profile_time:
                         text_fwd_times.append(result.get("forward_time_ms", 0.0))
                         vision_fwd_times.append(result.get("vision_forward_time_ms", 0.0))
+                        vision_data_load_times.append(result.get("vision_data_load_time_ms", 0.0))
                 else:
                     # Backwards compatibility
                     loss_values.append(result.item() if torch.is_tensor(result) else result)
@@ -382,6 +382,7 @@ def main(cfg: DictConfig):
             # Extract backward timing only if profiling is enabled
             avg_vision_fwd_ms = 0.0
             avg_vision_bwd_ms = 0.0
+            avg_vision_data_load_ms = 0.0
             avg_text_fwd_ms = 0.0
             avg_text_bwd_ms = 0.0
             if profile_time:
@@ -391,6 +392,7 @@ def main(cfg: DictConfig):
                 # Compute average timings across actors
                 avg_vision_fwd_ms = sum(vision_fwd_times) / len(vision_fwd_times) if vision_fwd_times else 0.0
                 avg_vision_bwd_ms = sum(vision_bwd_times) / len(vision_bwd_times) if vision_bwd_times else 0.0
+                avg_vision_data_load_ms = sum(vision_data_load_times) / len(vision_data_load_times) if vision_data_load_times else 0.0
                 avg_text_fwd_ms = sum(text_fwd_times) / len(text_fwd_times) if text_fwd_times else 0.0
                 avg_text_bwd_ms = sum(text_bwd_times) / len(text_bwd_times) if text_bwd_times else 0.0
 
@@ -434,7 +436,8 @@ def main(cfg: DictConfig):
                 timing_info = ""
                 if profile_time:
                     timing_info = (
-                        f", Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
+                        f", Vision data load: {avg_vision_data_load_ms:.1f}ms, "
+                        f"Vision fwd: {avg_vision_fwd_ms:.1f}ms, Vision bwd: {avg_vision_bwd_ms:.1f}ms, "
                         f"Text fwd: {avg_text_fwd_ms:.1f}ms, Text bwd: {avg_text_bwd_ms:.1f}ms"
                     )
                 if measure_metrics and iteration_start is not None:

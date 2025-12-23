@@ -698,6 +698,9 @@ class BaseTextTrainer(Trainer):
             f"[r{self.rank}] {self.__class__.__name__} initialized with {dataset_len} samples, batch_size={batch_size}"
         )
 
+        # Set up profilers for forward/backward
+        self._setup_profilers("text")
+
     def set_receiver_info(self, receiver_gpu_ids: list[str], use_ipc: bool):
         """Set receiver GPU IDs and whether to use CUDA IPC.
 
@@ -776,6 +779,7 @@ class BaseTextTrainer(Trainer):
 
         # Get vision forward timing if available
         vision_forward_time_ms = vision_data.get("forward_time_ms", 0.0)
+        vision_data_load_time_ms = vision_data.get("data_load_time_ms", 0.0)
 
         loss = self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
 
@@ -786,6 +790,10 @@ class BaseTextTrainer(Trainer):
             forward_time_ms = (time.perf_counter() - forward_start) * 1000
             result["forward_time_ms"] = forward_time_ms
             result["vision_forward_time_ms"] = vision_forward_time_ms
+            result["vision_data_load_time_ms"] = vision_data_load_time_ms
+
+        # Step the forward profiler
+        self._step_forward_profiler()
 
         return result
 
@@ -1047,6 +1055,8 @@ class BaseTextTrainer(Trainer):
             return result
 
         if grad_to_send is None:
+            # Step the backward profiler
+            self._step_backward_profiler()
             return _build_result(None)
 
         # Use CUDA IPC if configured and receiver info is available
@@ -1064,8 +1074,12 @@ class BaseTextTrainer(Trainer):
             logger.debug(
                 f"[r{self.rank}] {self.__class__.__name__}: Created gradient transfer request (use_ipc={transfer_request.use_ipc})"
             )
+            # Step the backward profiler
+            self._step_backward_profiler()
             return _build_result(transfer_request.to_dict())
         else:
+            # Step the backward profiler
+            self._step_backward_profiler()
             # Return gradients directly (Ray's default transport)
             return _build_result(grad_to_send)
 

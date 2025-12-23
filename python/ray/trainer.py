@@ -1,4 +1,5 @@
 import logging
+import os
 from abc import abstractmethod
 from contextlib import nullcontext
 
@@ -22,6 +23,77 @@ class Trainer(RayActor):
 
         seed = config["seed"]
         set_seed(seed)
+
+        # Profiler state (initialized by _setup_profilers)
+        self._profiler_enabled = False
+        self._profiler = None
+        self._trainer_type = None
+
+    def _setup_profilers(self, trainer_type: str):
+        """Set up PyTorch profiler for this trainer.
+
+        The profiler captures both forward and backward passes. Each trainer (vision/text)
+        has its own profiler that saves traces to separate directories per rank.
+
+        Args:
+            trainer_type: "vision" or "text" for directory naming
+        """
+        self._profiler_enabled = self.config.get("enable_profiler", False)
+        self._profiler = None
+        self._trainer_type = trainer_type
+
+        if not self._profiler_enabled:
+            return
+
+        profile_dir = self.config.get("profile_dir")
+        if profile_dir is None:
+            logger.warning(f"[r{self.rank}] Profiler enabled but profile_dir not set. Disabling profiler.")
+            self._profiler_enabled = False
+            return
+
+        warmup_steps = self.config.get("warmup_steps", 10)
+        profile_steps = self.config.get("profile_steps", 3)
+
+        # Create directory for this trainer's traces
+        trainer_dir = os.path.join(profile_dir, f"{trainer_type}_rank{self.rank}")
+        os.makedirs(trainer_dir, exist_ok=True)
+
+        logger.info(
+            f"[r{self.rank}] Setting up {trainer_type} profiler: "
+            f"warmup={warmup_steps}, active={profile_steps}, dir={trainer_dir}"
+        )
+
+        # Create single profiler for both forward and backward
+        # The profiler steps after backward_step, capturing both fwd and bwd in one step
+        self._profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=warmup_steps, active=profile_steps, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(trainer_dir),
+        )
+
+        # Start profiler (enter context)
+        self._profiler.__enter__()
+
+        logger.info(f"[r{self.rank}] {trainer_type} profiler started")
+
+    def _step_forward_profiler(self):
+        """No-op for forward - profiler steps after backward to capture both."""
+        pass
+
+    def _step_backward_profiler(self):
+        """Step the profiler after backward pass (captures both forward and backward)."""
+        if self._profiler_enabled and self._profiler is not None:
+            self._profiler.step()
+
+    def _cleanup_profilers(self):
+        """Clean up profiler (exit context)."""
+        if self._profiler is not None:
+            self._profiler.__exit__(None, None, None)
+            self._profiler = None
+        self._profiler_enabled = False
 
     def initialize_trainer(self):
         logger.debug(f"Initializing trainer {self.__class__.__name__}")
