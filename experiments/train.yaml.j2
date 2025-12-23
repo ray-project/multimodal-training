@@ -46,6 +46,9 @@ training:
   no_checkpoint: {{ no_checkpoint }}  # Disable checkpointing (default: false)
   checkpoint_dir: "{{ checkpoint_dir }}"  # Directory to save/load checkpoints (only used if no_checkpoint=false)
   log_interval: {{ log_interval }}  # Log training progress every N iterations
+  enable_profiler: {{ enable_profiler }}  # Enable PyTorch profiler for performance analysis
+  profile_dir: {{ profile_dir }}  # Directory to save profiler traces (required if enable_profiler is true)
+  profile_steps: {{ profile_steps }}  # Number of steps to profile after warmup (active profiling steps)
 
 # Data configuration
 data:

@@ -96,6 +96,9 @@ DEFAULT_TRAINING = {
     "no_checkpoint": True,  # Disable checkpointing (set to True to disable)
     "checkpoint_dir": "/tmp/checkpoints",  # Directory to save/load checkpoints
     "log_interval": 1,  # Log training progress every N iterations
+    "enable_profiler": False,  # Enable PyTorch profiler for performance analysis
+    "profile_dir": "null",  # Directory to save profiler traces (null = disabled)
+    "profile_steps": 3,  # Number of steps to profile after warmup
 }
 
 # AutoTP-specific default settings
@@ -322,6 +325,9 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "no_checkpoint": str(DEFAULT_TRAINING["no_checkpoint"]).lower(),
             "checkpoint_dir": DEFAULT_TRAINING["checkpoint_dir"],
             "log_interval": DEFAULT_TRAINING["log_interval"],
+            "enable_profiler": str(DEFAULT_TRAINING["enable_profiler"]).lower(),
+            "profile_dir": DEFAULT_TRAINING["profile_dir"],
+            "profile_steps": DEFAULT_TRAINING["profile_steps"],
             # Data
             "force_fixed_size": str(data_config["force_fixed_size"]).lower(),
             "min_pixels": min_pixels,
