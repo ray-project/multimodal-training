@@ -22,8 +22,8 @@ sys.path.insert(0, str(project_root))
 
 # Model settings: (model_type, model_name, warning)
 MODEL_SETTINGS = [
-    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", ""),
-    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", ""),
+    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", ""),
+    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", ""),
 ]
 
 # Token configurations: (label, max_pixels, min_pixels)
@@ -31,17 +31,17 @@ MODEL_SETTINGS = [
 # All values ensure num_windows % 8 == 0 for sequence parallelism compatibility
 TOKEN_CONFIGS = [
     ("1k_tokens", 200704, 200704),  # sqrt=448, 1024 vision tokens (closest to 1k)
-    # ("4k_tokens", 802816, 802816),  # sqrt=896, 4096 vision tokens (exact)
-    # ("8k_tokens", 1806336, 1806336),  # sqrt=1344, 9216 vision tokens (closest to 8k)
-    # ("16k_tokens", 3211264, 3211264),  # sqrt=1792, 16384 vision tokens (closest to 16k)
-    # ("32k_tokens", 5017600, 5017600),  # sqrt=2240, 25600 vision tokens (closest to 32k)
-    # ("64k_tokens", 12845056, 12845056),  # sqrt=3584, 65536 vision tokens (closest to 64k)
+    ("4k_tokens", 802816, 802816),  # sqrt=896, 4096 vision tokens (exact)
+    ("8k_tokens", 1806336, 1806336),  # sqrt=1344, 9216 vision tokens (closest to 8k)
+    ("16k_tokens", 3211264, 3211264),  # sqrt=1792, 16384 vision tokens (closest to 16k)
+    ("32k_tokens", 5017600, 5017600),  # sqrt=2240, 25600 vision tokens (closest to 32k)
+    ("64k_tokens", 12845056, 12845056),  # sqrt=3584, 65536 vision tokens (closest to 64k)
 ]
 
 # Parallelism strategies to test
 # Note: "sequence" parallelism is only valid for vision models, not text models
-VISION_PARALLELISM_OPTIONS = ["sequence"]
-TEXT_PARALLELISM_OPTIONS = ["tensor"]
+VISION_PARALLELISM_OPTIONS = ["sequence", "autotp"]
+TEXT_PARALLELISM_OPTIONS = ["autotp"]
 
 # Data parallel size options (1 = no data parallelism, >1 = replicate model across DP groups)
 # Vision: total GPUs = vision_dp_size * vision_parallel_size
@@ -53,15 +53,15 @@ TEXT_DP_SIZE_OPTIONS = [2]  # Data parallel size for text model
 # Vision: sequence parallel or tensor parallel size
 # Text: tensor parallel size
 # NOTE: vision and text parallel_size must be the same (required by training code)
-VISION_PARALLEL_SIZE_OPTIONS = [4]  # TP/SP size for vision model
-TEXT_PARALLEL_SIZE_OPTIONS = [4]  # TP size for text model (must match VISION_PARALLEL_SIZE_OPTIONS)
+VISION_PARALLEL_SIZE_OPTIONS = [8]  # TP/SP size for vision model
+TEXT_PARALLEL_SIZE_OPTIONS = [8]  # TP size for text model (must match VISION_PARALLEL_SIZE_OPTIONS)
 
 
 # DeepSpeed ZeRO stage
 # NOTE: AutoTP (text.parallelism="autotp") is NOT compatible with ZeRO stage 3.
 #       When using AutoTP, you must use zero_stage 1 or 2.
 VISION_ZERO_STAGE_OPTIONS = [1]
-TEXT_ZERO_STAGE_OPTIONS = [3]  # Change to [1] or [2] if using TEXT_PARALLELISM_OPTIONS = ["autotp"]
+TEXT_ZERO_STAGE_OPTIONS = [1]  # Change to [1] or [2] if using TEXT_PARALLELISM_OPTIONS = ["autotp"]
 
 # Attention backends
 # ATTENTION_BACKENDS = ["sdpa", "flash_attention_2"]
@@ -71,7 +71,8 @@ ATTENTION_BACKENDS = ["flash_attention_2"]
 ACTIVATION_CHECKPOINTING_OPTIONS = [True]
 
 # Autocast for mixed precision (enable torch.autocast)
-AUTOCAST_OPTIONS = [True]
+# AUTOCAST_OPTIONS = [True]
+AUTOCAST_OPTIONS = [False]
 
 # Data types
 DTYPE_OPTIONS = ["bfloat16"]

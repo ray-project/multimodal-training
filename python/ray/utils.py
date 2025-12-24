@@ -23,7 +23,14 @@ def get_physical_gpu_id() -> str:
 
 
 def prepare_runtime_environment() -> dict[str, str]:
-    env_vars = {}
+    env_vars = {
+        # AWS EFA/NCCL settings for multi-node communication
+        "LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+        "NCCL_NET_PLUGIN": "ofi",
+        "LD_LIBRARY_PATH": "/opt/aws-ofi-nccl/lib:/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/nccl/build/lib:/usr/local/cuda/lib64",
+        "FI_EFA_USE_DEVICE_RDMA": "1",
+        "NCCL_DEBUG": "INFO"
+    }
 
     if os.environ.get("WANDB_API_KEY"):
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]

@@ -90,7 +90,7 @@ for config_entry in "${CONFIGS[@]}"; do
     # Launch training and capture both stdout and stderr
     set +e  # Temporarily disable exit on error to capture failures
 {%- endraw %}
-    python -m python.train_ray \
+    python3 -m python.train_ray \
         --config-path=../{{ config_dir }} \
 {%- raw %}
         --config-name=${config_name} >> ${log_file} 2>&1
