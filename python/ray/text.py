@@ -555,20 +555,24 @@ class BaseTextTrainer(Trainer):
                     original_lm_head_weight[start_idx:end_idx, :].to(device)
                 )
 
-        # Apply FSDP2 to transformer layers
-        # When dp_size=1, this is a no-op but keeps the code uniform
+        # Apply FSDP2 to transformer layers only when dp_size > 1
+        # IMPORTANT: Do NOT apply FSDP2 when dp_size=1, even though it would be a no-op.
+        # FSDP2 adds memory overhead for wrapper state tracking, which can cause OOM
+        # on memory-intensive workloads (e.g., 64k token sequences with 32B models).
+        #
         # Note: We don't apply FSDP2 to the embedding or lm_head because:
         # 1. Embedding uses custom VocabParallelEmbedding with manual sharding/all-reduce
         # 2. lm_head uses the same vocab-parallel weights (tied or sharded)
-        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+        if dp_size > 1:
+            from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 
-        dtype = self._get_torch_dtype(self.config.get("dtype", "bfloat16"))
-        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+            dtype = self._get_torch_dtype(self.config.get("dtype", "bfloat16"))
+            mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
-        for layer in layers:
-            fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+            for layer in layers:
+                fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
 
-        logger.debug(f"[r{self.rank}] FSDP2 applied to transformer layers (dp_size={dp_size})")
+            logger.debug(f"[r{self.rank}] FSDP2 applied to transformer layers (dp_size={dp_size})")
 
         # Store device mesh for later use
         model.device_mesh = device_mesh
