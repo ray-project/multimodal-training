@@ -170,14 +170,24 @@ class BaseTextTrainer(Trainer):
         return model, lm_head, tp_group
 
     def _validate_tensor_parallelism(self, model_config, tp_world_size=None):
-        """Validate that tensor parallelism is compatible with model config."""
+        """Validate that tensor parallelism is compatible with model config.
+
+        Args:
+            model_config: Model configuration
+            tp_world_size: Tensor parallel world size. If None, will be calculated from
+                           global world size and dp_size from config.
+        """
         if tp_world_size is None:
             init_distributed_comm(backend="nccl")
             import torch.distributed as dist
 
             if not dist.is_initialized():
                 return
-            tp_world_size = dist.get_world_size()
+            world_size = dist.get_world_size()
+
+            # Account for data parallelism - tp_world_size = world_size / dp_size
+            dp_size = self.config["dp_size"]
+            tp_world_size = world_size // dp_size
 
         # Get num_key_value_heads from text_config
         text_config = getattr(model_config, "text_config", model_config)
@@ -185,7 +195,7 @@ class BaseTextTrainer(Trainer):
         if num_kv_heads % tp_world_size != 0:
             raise ValueError(
                 f"Tensor parallel world size must divide num_key_value_heads. "
-                f"Got world size {tp_world_size} and num_key_value_heads {num_kv_heads}."
+                f"Got TP world size {tp_world_size} and num_key_value_heads {num_kv_heads}."
             )
 
     def _build_model_with_deepspeed(self, config, model_config, device, torch_dtype, load_pretrained_path=None):
@@ -446,19 +456,68 @@ class BaseTextTrainer(Trainer):
         return model_engine, lm_head, tp_group
 
     def _apply_tensor_parallelism(self, model, lm_head, model_config, device):
-        """Apply tensor parallelism to model, lm_head, and return tp_group."""
+        """Apply tensor parallelism to model, lm_head, and return tp_group.
+
+        Always uses a 2D device mesh (dp_size, tp_size) for consistency.
+        When dp_size=1, this is effectively TP-only.
+        When dp_size>1, FSDP2 is applied for data parallelism after DTensor TP.
+        """
         import torch.distributed as dist
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor.parallel import parallelize_module
 
         assert dist.is_initialized(), "Distributed must be initialized for tensor parallelism."
 
-        tp_world_size = dist.get_world_size()
-        tp_mesh = init_device_mesh("cuda", (tp_world_size,))
+        world_size = dist.get_world_size()
+        global_rank = dist.get_rank()
 
-        logger.debug(f"[r{self.rank}] Applying tensor parallelism to text model...")
+        # Get DP size from config
+        dp_size = self.config["dp_size"]
+        tp_size = world_size // dp_size
 
-        # Replace embedding with VocabParallelEmbedding for correct vocabulary parallelism
+        # Validate configuration
+        if dp_size * tp_size != world_size:
+            raise ValueError(
+                f"dp_size ({dp_size}) * tp_size ({tp_size}) must equal world_size ({world_size})"
+            )
+
+        # Calculate TP and DP ranks
+        tp_rank = global_rank % tp_size
+        dp_rank = global_rank // tp_size
+
+        # Store parallelism info (use _parallel_info dict to avoid conflicts with model properties)
+        model._parallel_info = {
+            "tp_size": tp_size,
+            "dp_size": dp_size,
+            "tp_rank": tp_rank,
+            "dp_rank": dp_rank,
+        }
+
+        # Always create 2D device mesh: (dp, tp) for consistency
+        # When dp_size=1, this is effectively TP-only but with uniform mesh structure
+        logger.debug(f"[r{self.rank}] Creating 2D device mesh: dp_size={dp_size}, tp_size={tp_size}")
+        device_mesh = init_device_mesh(
+            "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        )
+        tp_mesh = device_mesh["tp"]
+        dp_mesh = device_mesh["dp"]
+        tp_group = tp_mesh.get_group()
+
+        logger.debug(
+            f"[r{self.rank}] Applying tensor parallelism to text model "
+            f"(tp_rank={tp_rank}, dp_rank={dp_rank})..."
+        )
+
+        # Parallelize transformer layers first
+        layers = self._get_transformer_layers(model)
+        if layers is None:
+            raise ValueError("Unable to locate decoder layers for tensor parallelism.")
+
+        tp_mapping = self._get_tensor_parallel_mapping()
+        for layer in layers:
+            parallelize_module(layer, tp_mesh, tp_mapping, src_data_rank=0)
+
+        # Replace embedding with VocabParallelEmbedding for vocab-parallel loss computation
         logger.debug(f"[r{self.rank}] Replacing embedding layer with VocabParallelEmbedding...")
         original_embedding = self._get_embedding_module(model)
         if original_embedding is None:
@@ -468,7 +527,7 @@ class BaseTextTrainer(Trainer):
             num_embeddings=original_embedding.num_embeddings,
             embedding_dim=original_embedding.embedding_dim,
             padding_idx=original_embedding.padding_idx,
-            tp_group=tp_mesh.get_group(),
+            tp_group=tp_group,
             tp_mesh=tp_mesh,
             dtype=original_embedding.weight.dtype,
             device=device,
@@ -481,26 +540,13 @@ class BaseTextTrainer(Trainer):
             vocab_parallel_embedding.weight.data.copy_(original_embedding.weight.data[start_idx:end_idx])
 
         # Replace the embedding layer in the model
-        # For Qwen models, this is model.embed_tokens
-        # For InternVL, we need to search through the model hierarchy
         self._replace_embedding_module(model, vocab_parallel_embedding)
         logger.debug(
             f"[r{self.rank}] Embedding replaced: vocab_range=[{start_idx}, {end_idx}), "
             f"partition_size={end_idx - start_idx}"
         )
 
-        # Parallelize transformer layers
-        layers = self._get_transformer_layers(model)
-        if layers is None:
-            raise ValueError("Unable to locate decoder layers for tensor parallelism.")
-
-        tp_mapping = self._get_tensor_parallel_mapping()
-        for layer in layers:
-            parallelize_module(layer, tp_mesh, tp_mapping, src_data_rank=0)
-
         # Handle lm_head sharding based on weight tying configuration
-        # If weights are tied, lm_head.weight will be set to VocabParallelEmbedding.weight later
-        # If weights are NOT tied, we must manually shard lm_head for correct vocab-parallel loss
         if not getattr(model.config, "tie_word_embeddings", True):
             logger.debug(f"[r{self.rank}] Sharding lm_head for untied embeddings (vocab_range=[{start_idx}, {end_idx}))")
             with torch.no_grad():
@@ -509,7 +555,27 @@ class BaseTextTrainer(Trainer):
                     original_lm_head_weight[start_idx:end_idx, :].to(device)
                 )
 
-        return tp_mesh.get_group()
+        # Apply FSDP2 to transformer layers
+        # When dp_size=1, this is a no-op but keeps the code uniform
+        # Note: We don't apply FSDP2 to the embedding or lm_head because:
+        # 1. Embedding uses custom VocabParallelEmbedding with manual sharding/all-reduce
+        # 2. lm_head uses the same vocab-parallel weights (tied or sharded)
+        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+
+        dtype = self._get_torch_dtype(self.config.get("dtype", "bfloat16"))
+        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+
+        for layer in layers:
+            fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+
+        logger.debug(f"[r{self.rank}] FSDP2 applied to transformer layers (dp_size={dp_size})")
+
+        # Store device mesh for later use
+        model.device_mesh = device_mesh
+        model.tp_mesh = tp_mesh
+        model.dp_mesh = dp_mesh
+
+        return tp_group
 
     def load_pretrained_weights(self, checkpoint_path: str):
         """
@@ -927,7 +993,7 @@ class BaseTextTrainer(Trainer):
         # Get autocast context for mixed precision
         autocast_context = self._get_autocast_context()
 
-        # Forward pass through text model with combined embeddings and position_ids with autocast
+        # Forward pass through text model with combined embeddings and position_ids
         with autocast_context:
             text_outputs = self.model(
                 inputs_embeds=inputs_embeds,
@@ -941,12 +1007,13 @@ class BaseTextTrainer(Trainer):
             logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: logits shape={logits.shape}")
 
             # Compute loss for next-token prediction
-            # Use vocab_parallel_causal_cross_entropy for tensor parallelism (DTensor) or AutoTP with vocab_parallel
+            # Use vocab_parallel_causal_cross_entropy for tensor/autotp parallelism with VocabParallelEmbedding
             parallelism = self.config.get("parallelism")
             tp_group = getattr(self.model, "tp_group", None)
             use_tp_loss = tp_group is not None and (
                 parallelism == "tensor" or (parallelism == "autotp" and self.config.get("use_vocab_parallel", True))
             )
+
             if use_tp_loss:
                 import torch.distributed as dist
 
@@ -961,6 +1028,7 @@ class BaseTextTrainer(Trainer):
                     ignore_index=-100,
                 )
             else:
+                # Standard cross-entropy loss for non-TP modes
                 shift_logits = logits[:, :-1, :].contiguous().float()
                 shift_labels = labels[:, 1:].contiguous()
                 loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -968,7 +1036,8 @@ class BaseTextTrainer(Trainer):
         # Save loss for backward pass
         self.loss = loss
 
-        logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: loss={loss.item():.4f}")
+        loss_value = loss.item()
+        logger.debug(f"[r{self.rank}] {self.__class__.__name__} forward_step: loss={loss_value:.4f}")
 
         return loss
 

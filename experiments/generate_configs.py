@@ -20,7 +20,7 @@ from jinja2 import Template
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# Model settings: (model_type, model_name, tp_size, warning)
+# Model settings: (model_type, model_name, warning)
 MODEL_SETTINGS = [
     ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", ""),
     # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", ""),
@@ -44,17 +44,14 @@ VISION_PARALLELISM_OPTIONS = ["sequence"]
 TEXT_PARALLELISM_OPTIONS = ["tensor"]
 
 # Data parallel size options (1 = no data parallelism, >1 = replicate model across DP groups)
-# Vision: total GPUs = vision_dp_size * vision_parallel_size
-# Text: total GPUs = text_dp_size * text_parallel_size
-VISION_DP_SIZE_OPTIONS = [2]  # Data parallel size for vision model
-TEXT_DP_SIZE_OPTIONS = [2]  # Data parallel size for text model
+# NOTE: Vision and text dp_size must be the same (required by training code)
+DP_SIZE_OPTIONS = [1]  # Data parallel size (1 = TP only, >1 = TP+DP)
 
 # TP/SP size options per DP replica
 # Vision: sequence parallel or tensor parallel size
 # Text: tensor parallel size
 # NOTE: vision and text parallel_size must be the same (required by training code)
-VISION_PARALLEL_SIZE_OPTIONS = [4]  # TP/SP size for vision model
-TEXT_PARALLEL_SIZE_OPTIONS = [4]  # TP size for text model (must match VISION_PARALLEL_SIZE_OPTIONS)
+PARALLEL_SIZE_OPTIONS = [4]  # TP/SP size per DP replica
 
 
 # DeepSpeed ZeRO stage
@@ -215,7 +212,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
 
     # Generate all combinations
     for (
-        (model_type, model_name, tp_size, warning),
+        (model_type, model_name, warning),
         (token_label, max_pixels, min_pixels),
         vision_par,
         text_par,
@@ -227,6 +224,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
         vision_zero_stage,
         text_zero_stage,
         dp_size,
+        parallel_size,
     ) in product(
         MODEL_SETTINGS,
         TOKEN_CONFIGS,
@@ -240,6 +238,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
         VISION_ZERO_STAGE_OPTIONS,
         TEXT_ZERO_STAGE_OPTIONS,
         DP_SIZE_OPTIONS,
+        PARALLEL_SIZE_OPTIONS,
     ):
 
         # Determine reduce_bucket_size based on token configuration
@@ -280,7 +279,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             "gradient_accumulation_steps": DEFAULT_TRAINING["gradient_accumulation_steps"],
             "seed": DEFAULT_TRAINING["seed"],
             "dp_size": dp_size,  # Data parallel size
-            "parallel_size": tp_size,  # TP/SP size per DP replica
+            "parallel_size": parallel_size,  # TP/SP size per DP replica
             "collocate": str(DEFAULT_TRAINING["collocate"]).lower(),
             "clip_grad_norm": str(DEFAULT_TRAINING["clip_grad_norm"]).lower(),
             "max_grad_norm": DEFAULT_TRAINING["max_grad_norm"],
@@ -318,7 +317,8 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
             {
                 "name": config_name,
                 "file": str(config_file),
-                "tp_size": tp_size,
+                "parallel_size": parallel_size,
+                "dp_size": dp_size,
                 "warning": warning,
             }
         )
@@ -332,7 +332,7 @@ def generate_configs(output_dir, mscoco_data_path=None, laion_data_path=None):
     manifest_path = output_path / "manifest.txt"
     with open(manifest_path, "w") as f:
         for cfg in configs:
-            f.write(f"{cfg['name']}\t{cfg['file']}\t{cfg['tp_size']}\t{cfg['warning']}\n")
+            f.write(f"{cfg['name']}\t{cfg['file']}\t{cfg['parallel_size']}\t{cfg['dp_size']}\t{cfg['warning']}\n")
 
     print(f"Manifest written to {manifest_path}")
 

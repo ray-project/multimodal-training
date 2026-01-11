@@ -32,6 +32,11 @@ class Trainer(RayActor):
 
         Args:
             modality: Modality filter for the dataloader ("image", "all", etc.)
+
+        For TP+DP setups:
+        - All actors in the same TP group see the same data (same dp_rank)
+        - Different DP groups see different data (different dp_rank)
+        - Seeding is based on dp_rank to ensure proper data distribution
         """
         from transformers import AutoProcessor
 
@@ -66,9 +71,18 @@ class Trainer(RayActor):
         batch_size = self.config["batch_size"]
         seed = self.config["seed"]
 
-        # Fixed rank/world_size for now
-        rank = 0
-        world_size = 1
+        # Get DP configuration for data sampling
+        # For TP+DP: use dp_rank for data sampling so each DP group sees different data
+        # All ranks in the same TP group see the same data (same dp_rank)
+        dp_size = self.config["dp_size"]
+        parallel_size = self.config["parallel_size"]
+
+        # Calculate dp_rank based on global rank
+        # Actors are organized as: [dp0_tp0, dp0_tp1, ..., dp0_tpN, dp1_tp0, dp1_tp1, ...]
+        # When dp_size=1, all ranks have dp_rank=0 (same data for all TP ranks)
+        dp_rank = self.rank // parallel_size
+        data_rank = dp_rank
+        data_world_size = dp_size
 
         # Setup reproducibility for tensor/sequence parallelism
         generator = None
@@ -78,13 +92,16 @@ class Trainer(RayActor):
 
             import numpy as _np
 
+            # Use seed + dp_rank so different DP groups get different data
+            effective_seed = seed + data_rank
+
             def _worker_init_fn(worker_id: int):
-                s = seed + worker_id
+                s = effective_seed + worker_id
                 _np.random.seed(s)
                 _rnd.seed(s)
                 torch.manual_seed(s)
 
-            generator = torch.Generator(device="cpu").manual_seed(seed)
+            generator = torch.Generator(device="cpu").manual_seed(effective_seed)
             worker_init_fn = _worker_init_fn
         elif parallelism not in ["deepspeed"]:
             raise ValueError(f"[r{self.rank}] Unsupported parallelism mode: {parallelism}")
@@ -94,13 +111,13 @@ class Trainer(RayActor):
             processor=processor,
             data_config=data_cfg,
             batch_size=batch_size,
-            rank=rank,
-            world_size=world_size,
+            rank=data_rank,
+            world_size=data_world_size,
             generator=generator,
             worker_init_fn=worker_init_fn,
             drop_last=True,
             modality=modality,
-            seed=seed,
+            seed=seed + data_rank,  # Different seed per DP group
         )
 
         return dataloader

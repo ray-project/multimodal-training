@@ -164,7 +164,7 @@ def main(cfg: DictConfig):
         text_config.update(dict(cfg.deepspeed))
 
     # Add DP/TP configuration for proper parallelism setup
-    dp_size = cfg.training.get("dp_size", 1)
+    dp_size = cfg.training.dp_size
     parallel_size = cfg.training.parallel_size  # TP/SP size per DP replica
 
     # For vision with sequence parallel, set sequence_parallel_size (not world_size)
@@ -177,7 +177,7 @@ def main(cfg: DictConfig):
 
     # Get number of actors and collocation setting from config
     parallel_size = cfg.training.parallel_size  # TP/SP size per DP replica
-    dp_size = cfg.training.get("dp_size", 1)  # Data parallel size (default: 1)
+    dp_size = cfg.training.dp_size  # Data parallel size
     collocate = cfg.training.collocate
 
     # Calculate total actors needed: dp_size * parallel_size
