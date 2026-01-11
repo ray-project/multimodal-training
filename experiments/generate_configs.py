@@ -22,8 +22,8 @@ sys.path.insert(0, str(project_root))
 
 # Model settings: (model_type, model_name, tp_size, warning)
 MODEL_SETTINGS = [
-    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", 4, ""),
-    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", 8, ""),
+    ("qwen2_5_vl", "Qwen/Qwen2.5-VL-7B-Instruct", ""),
+    # ("qwen2_5_vl", "Qwen/Qwen2.5-VL-32B-Instruct", ""),
 ]
 
 # Token configurations: (label, max_pixels, min_pixels)
@@ -40,14 +40,26 @@ TOKEN_CONFIGS = [
 
 # Parallelism strategies to test
 # Note: "sequence" parallelism is only valid for vision models, not text models
-VISION_PARALLELISM_OPTIONS = ["sequence", "tensor"]
+VISION_PARALLELISM_OPTIONS = ["sequence"]
 TEXT_PARALLELISM_OPTIONS = ["tensor"]
 
 # Data parallel size options (1 = no data parallelism, >1 = replicate model across DP groups)
-# Total GPUs = dp_size * parallel_size
-DP_SIZE_OPTIONS = [1]
+# Vision: total GPUs = vision_dp_size * vision_parallel_size
+# Text: total GPUs = text_dp_size * text_parallel_size
+VISION_DP_SIZE_OPTIONS = [2]  # Data parallel size for vision model
+TEXT_DP_SIZE_OPTIONS = [2]  # Data parallel size for text model
 
-# DeepSpeed ZeRO stage (only used when parallelism is "deepspeed")
+# TP/SP size options per DP replica
+# Vision: sequence parallel or tensor parallel size
+# Text: tensor parallel size
+# NOTE: vision and text parallel_size must be the same (required by training code)
+VISION_PARALLEL_SIZE_OPTIONS = [4]  # TP/SP size for vision model
+TEXT_PARALLEL_SIZE_OPTIONS = [4]  # TP size for text model (must match VISION_PARALLEL_SIZE_OPTIONS)
+
+
+# DeepSpeed ZeRO stage
+# NOTE: AutoTP (text.parallelism="autotp") is NOT compatible with ZeRO stage 3.
+#       When using AutoTP, you must use zero_stage 1 or 2.
 VISION_ZERO_STAGE_OPTIONS = [1]
 TEXT_ZERO_STAGE_OPTIONS = [3]
 
@@ -97,8 +109,8 @@ DEFAULT_AUTOTP = {
 # 1. Command line argument (--data-path, --laion-data-path)
 # 2. Environment variable (MSCOCO_DATA_PATH, LAION_POP_DATA_PATH)
 # 3. Hardcoded default
-DEFAULT_MSCOCO_PATH_FALLBACK = "__PATH_TO_MSCOCO2017__"
-DEFAULT_LAION_POP_PATH_FALLBACK = "__PATH_TO_LAION_POP__"
+DEFAULT_MSCOCO_PATH_FALLBACK = "/mnt/local_storage/mscoco2017"
+DEFAULT_LAION_POP_PATH_FALLBACK = "/mnt/local_storage/laion"
 
 
 def get_data_config(mscoco_data_path=None, laion_data_path=None):

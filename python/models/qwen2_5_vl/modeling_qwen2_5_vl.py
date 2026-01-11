@@ -335,7 +335,9 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.k_proj = nn.Linear(self.dim, self.dim, bias=True)
         self.v_proj = nn.Linear(self.dim, self.dim, bias=True)
 
-        self.proj = nn.Linear(self.dim, self.dim)
+        # Named o_proj (not just proj) for DeepSpeed AutoTP compatibility
+        # AutoTP detects row-parallel layers by patterns: "o_proj", "out_proj", "down_proj"
+        self.o_proj = nn.Linear(self.dim, self.dim)
         self.scaling = self.head_dim**-0.5
         self.config = config
         self.attention_dropout = 0.0
@@ -468,7 +470,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
             attn_output = torch.cat(attn_outputs, dim=1)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.proj(attn_output)
+        attn_output = self.o_proj(attn_output)
         return attn_output
 
     def _forward_sequence_parallel(
@@ -577,7 +579,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
             attn_output = torch.cat(attn_outputs, dim=1)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.proj(attn_output)
+        attn_output = self.o_proj(attn_output)
         return attn_output
 
     def _forward_sequence_parallel_full(
@@ -760,7 +762,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
             return_lengths=False,
         )
         attn_output = attn_flat.view(-1, local_num_heads * self.head_dim)
-        attn_output = self.proj(attn_output)
+        attn_output = self.o_proj(attn_output)
         return attn_output
 
 

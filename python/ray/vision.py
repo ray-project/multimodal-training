@@ -690,7 +690,7 @@ class QwenVisionTrainer(BaseVisionTrainer):
             "attn.q_proj": ColwiseParallel(),
             "attn.k_proj": ColwiseParallel(),
             "attn.v_proj": ColwiseParallel(),
-            "attn.proj": RowwiseParallel(),
+            "attn.o_proj": RowwiseParallel(),  # Named o_proj for DeepSpeed AutoTP compatibility
             "mlp.gate_proj": ColwiseParallel(),
             "mlp.up_proj": ColwiseParallel(),
             "mlp.down_proj": RowwiseParallel(),
