@@ -261,10 +261,19 @@ class Trainer(RayActor):
             model: The model to apply checkpointing to
             activation_checkpointing: Whether to enable activation checkpointing
             model_name: Name of the model for logging
+
+        Note:
+            When using ZeRO-3 with tensor.backward(gradient=...) pattern (disaggregated training),
+            we must use use_reentrant=False. The reentrant checkpoint (default in HuggingFace)
+            doesn't properly track requires_grad with ZeRO-3's parameter gathering, causing
+            the output tensor to lose gradient tracking.
         """
         if activation_checkpointing:
-            model.gradient_checkpointing_enable()
-            logger.debug(f"[r{self.rank}] Activation checkpointing enabled for {model_name}")
+            # Use non-reentrant checkpointing for ZeRO-3 compatibility with tensor.backward(gradient=...)
+            # See: https://github.com/deepspeedai/DeepSpeed/pull/7665
+            gradient_checkpointing_kwargs = {"use_reentrant": False}
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+            logger.debug(f"[r{self.rank}] Activation checkpointing enabled for {model_name} (use_reentrant=False)")
 
     def _reset_initialized_flag(self, model):
         """Reset HuggingFace _is_hf_initialized flag for weight initialization."""

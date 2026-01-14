@@ -1224,6 +1224,72 @@ class Qwen3TextMixin:
         }
 
 
+class Qwen3VLMoeTextMixin:
+    """Qwen3-VL-MoE text model helpers with MoE support."""
+
+    def _load_model_config(self, model_name):
+        """Load Qwen3-VL-MoE model config."""
+        from ..models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig
+
+        config = Qwen3VLMoeConfig.from_pretrained(model_name, trust_remote_code=True)
+
+        # Support layer override for testing with reduced layers
+        num_layers_override = self.config.get("num_hidden_layers_override", None)
+        if num_layers_override is not None:
+            logger.info(f"[r{self.rank}] Overriding num_hidden_layers from {config.text_config.num_hidden_layers} to {num_layers_override}")
+            config.text_config.num_hidden_layers = num_layers_override
+
+        return config
+
+    def _create_model_and_lm_head(self, model_config):
+        """Create Qwen3-VL-MoE text model and lm_head."""
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextModel
+
+        model = Qwen3VLMoeTextModel._from_config(model_config.text_config)
+        lm_head = nn.Linear(model_config.text_config.hidden_size, model_config.text_config.vocab_size, bias=False)
+        return model, lm_head
+
+    def _get_embedding_module(self, model):
+        """Get embedding module for Qwen3-MoE."""
+        return model.embed_tokens
+
+    def _get_transformer_layers(self, model):
+        """Get transformer layers for Qwen3-MoE."""
+        return model.layers
+
+    def _get_tensor_parallel_mapping(self):
+        """Get tensor parallel mapping for Qwen3-MoE.
+
+        Note: MoE layers require expert parallelism. For now, we only
+        parallelize attention layers. Expert parallelism would require
+        a more sophisticated sharding strategy.
+        """
+        from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
+        return {
+            "self_attn.q_proj": ColwiseParallel(),
+            "self_attn.k_proj": ColwiseParallel(),
+            "self_attn.v_proj": ColwiseParallel(),
+            "self_attn.o_proj": RowwiseParallel(),
+            # Note: MoE expert layers are NOT sharded with standard TP
+            # They would require expert parallelism (EP) which routes experts to different ranks
+        }
+
+
+@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
+class Qwen3VLMoeTextTrainer(Qwen3VLMoeTextMixin, BaseTextTrainer):
+    """Qwen3-VL-MoE text trainer with MoE support.
+
+    This trainer handles the MoE text decoder with 128 experts where 8 are active per token.
+    For distributed training, it primarily uses DeepSpeed AutoTP which handles
+    expert parallelism automatically.
+    """
+
+    def __init__(self, config, rank: int):
+        super().__init__(config, rank)
+        self.deepstack_features = None  # Store DeepStack features for backward pass
+
+
 @ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
 class Qwen3TextTrainer(Qwen3TextMixin, BaseTextTrainer):
     """Qwen3-VL text trainer with DeepStack support."""

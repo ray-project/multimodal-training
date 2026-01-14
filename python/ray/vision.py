@@ -1027,3 +1027,234 @@ class Qwen3VisionTrainer(BaseVisionTrainer):
             backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
         return {"backward_time_ms": backward_time_ms}
+
+
+@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
+class Qwen3VLMoeVisionTrainer(BaseVisionTrainer):
+    """Qwen3-VL-MoE vision trainer.
+
+    The vision encoder for Qwen3-VL-MoE is identical to Qwen3-VL (non-MoE),
+    so this trainer reuses most of the Qwen3VisionTrainer logic.
+    """
+
+    def _load_model_config(self, model_name):
+        """Load Qwen3-VL-MoE model config."""
+        from ..models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig
+
+        return Qwen3VLMoeConfig.from_pretrained(model_name, trust_remote_code=True)
+
+    def _create_model_instance(self, model_config):
+        """Create Qwen3-VL-MoE vision model instance.
+
+        Uses HuggingFace's Qwen3VLMoeVisionModel for better compatibility with DeepSpeed.
+        """
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeVisionModel
+
+        model = Qwen3VLMoeVisionModel(model_config.vision_config)
+        return model, None  # No projector for Qwen3-MoE
+
+    def _get_transformer_layers(self, model):
+        """Get transformer blocks for Qwen3-MoE."""
+        return model.blocks
+
+    def _get_projector_or_merger(self, model, projector):
+        """Get merger module for Qwen3-MoE."""
+        return model.merger
+
+    def _get_tensor_parallel_mapping(self):
+        """Get tensor parallel mapping for Qwen3-MoE transformer layers.
+
+        Note: Qwen3-VL-MoE uses fused QKV (single qkv linear layer).
+        """
+        return {
+            # Qwen3-MoE uses fused QKV
+            "attn.qkv": ColwiseParallel(),
+            "attn.proj": RowwiseParallel(),
+            # MLP uses standard gated architecture
+            "mlp.fc1": ColwiseParallel(),
+            "mlp.fc2": RowwiseParallel(),
+        }
+
+    def _parallelize_projector_or_merger(self, model, projector, tp_mesh):
+        """Parallelize Qwen3-MoE merger and DeepStack mergers."""
+        # Main merger
+        parallelize_module(model.merger.linear_fc1, tp_mesh, ColwiseParallel(), src_data_rank=None)
+        parallelize_module(model.merger.linear_fc2, tp_mesh, RowwiseParallel(), src_data_rank=None)
+
+        # DeepStack mergers
+        for ds_merger in model.deepstack_merger_list:
+            parallelize_module(ds_merger.linear_fc1, tp_mesh, ColwiseParallel(), src_data_rank=None)
+            parallelize_module(ds_merger.linear_fc2, tp_mesh, RowwiseParallel(), src_data_rank=None)
+
+    def _setup_sequence_parallel(self, model, sp_group):
+        """Set up sequence parallelism for Qwen3-MoE.
+
+        Args:
+            model: The Qwen3-MoE vision model instance
+            sp_group: The DeepSpeed sequence parallel process group
+        """
+        for m in model.modules():
+            if m.__class__.__name__ in ["Qwen3VLMoeVisionAttention", "Qwen3VLMoeVisionModel"]:
+                m.sp_group = sp_group
+
+    def _get_vision_config(self, model_name):
+        """Get Qwen3-VL-MoE vision config."""
+        from ..models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig
+
+        config = Qwen3VLMoeConfig.from_pretrained(model_name, trust_remote_code=True)
+        return config.vision_config
+
+    def _model_forward(self, batch):
+        """Forward pass for Qwen3-VL-MoE vision encoder."""
+        pixel_values = batch["pixel_values"]
+        image_grid_thw = batch["image_grid_thw"]
+
+        # Get autocast context for mixed precision
+        autocast_context = self._get_autocast_context()
+
+        # Handle batched inputs
+        if pixel_values.dim() == 5:  # [batch_size, C, T, H, W]
+            batch_size = pixel_values.shape[0]
+
+            if image_grid_thw.dim() == 1:
+                image_grid_thw = image_grid_thw.unsqueeze(0).expand(batch_size, -1)
+            elif image_grid_thw.dim() == 2 and image_grid_thw.shape[0] != batch_size:
+                raise ValueError(
+                    f"image_grid_thw batch dimension {image_grid_thw.shape[0]} doesn't match "
+                    f"pixel_values batch dimension {batch_size}"
+                )
+
+            logger.debug(
+                f"[r{self.rank}] Qwen3-MoE forward batched: pixel_values={pixel_values.shape}, grid_thw={image_grid_thw.shape}"
+            )
+
+            # Forward with HF model
+            with autocast_context:
+                # HF Qwen3VLMoeVisionModel returns (hidden_states, deepstack_features)
+                vision_outputs, deepstack_features = self.model(
+                    hidden_states=pixel_values,
+                    grid_thw=image_grid_thw,
+                )
+
+            # Reshape to [batch_size, num_tokens_per_image, hidden_size]
+            total_tokens = vision_outputs.shape[0]
+            num_tokens_per_image = total_tokens // batch_size
+            vision_outputs = vision_outputs.reshape(batch_size, num_tokens_per_image, -1)
+
+            # Reshape DeepStack features if present
+            if deepstack_features is not None:
+                deepstack_features = [
+                    ds.reshape(batch_size, num_tokens_per_image, -1) for ds in deepstack_features
+                ]
+
+            logger.debug(
+                f"[r{self.rank}] Qwen3-MoE forward batched output shape={vision_outputs.shape}, "
+                f"deepstack features={len(deepstack_features) if deepstack_features else 0}"
+            )
+        else:
+            # Single sample case
+            if image_grid_thw.dim() == 1:
+                image_grid_thw = image_grid_thw.unsqueeze(0)
+
+            logger.debug(
+                f"[r{self.rank}] Qwen3-MoE forward single: pixel_values={pixel_values.shape}, grid_thw={image_grid_thw.shape}"
+            )
+
+            with autocast_context:
+                # HF Qwen3VLMoeVisionModel returns (hidden_states, deepstack_features)
+                vision_outputs, deepstack_features = self.model(
+                    hidden_states=pixel_values,
+                    grid_thw=image_grid_thw,
+                )
+
+            # Add batch dimension
+            vision_outputs = vision_outputs.unsqueeze(0)
+            if deepstack_features is not None:
+                deepstack_features = [ds.unsqueeze(0) for ds in deepstack_features]
+
+            logger.debug(f"[r{self.rank}] Qwen3-MoE forward single output shape={vision_outputs.shape}")
+
+        # Return just embeddings for now (DeepStack temporarily disabled for debugging)
+        return vision_outputs
+
+    def _zero_padded_weights_after_init(self, model, projector):
+        """Qwen3-MoE does not use padded attention heads, so this is a no-op."""
+        pass
+
+    def forward_step(self, iteration: int = -1):
+        """Run one forward pass on the vision model."""
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            forward_start = time.perf_counter()
+
+        self._current_iteration = iteration
+
+        try:
+            batch = next(self.data_iterator)
+        except StopIteration:
+            self.data_iterator = iter(self.dataloader)
+            batch = next(self.data_iterator)
+
+        logger.debug(f"[r{self.rank}] Qwen3-MoE Vision forward_step: iteration={iteration}")
+
+        sample_index = batch.get("sample_index", None)
+        if sample_index is not None and isinstance(sample_index, torch.Tensor):
+            sample_index = sample_index.item() if sample_index.numel() == 1 else sample_index.tolist()
+
+        # Move tensors to CUDA
+        device = torch.device("cuda:0")
+        batch["pixel_values"] = batch["pixel_values"].to(device, non_blocking=True)
+        batch["image_grid_thw"] = batch["image_grid_thw"].to(device, non_blocking=True)
+
+        # Call model forward
+        vision_outputs = self._model_forward(batch)
+
+        # Synchronize and measure timing
+        forward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            forward_time_ms = (time.perf_counter() - forward_start) * 1000
+
+        # Enqueue outputs for backward pass
+        self._pending_outputs.append(vision_outputs)
+
+        # Build result
+        result = {
+            "vision_embeddings": vision_outputs,
+            "sample_index": sample_index,
+            "iteration": iteration,
+            "forward_time_ms": forward_time_ms,
+        }
+
+        # Handle CUDA IPC transfer
+        if self.use_ipc and self.receiver_gpu_ids is not None:
+            sender_gpu_id = get_physical_gpu_id()
+            transfer_request = prepare_tensor_for_transfer(
+                vision_outputs.detach(),
+                receiver_gpu_ids=self.receiver_gpu_ids,
+                sender_gpu_id=sender_gpu_id,
+                use_ipc_if_same_gpu=True,
+            )
+            result["vision_embeddings"] = transfer_request.to_dict()
+
+        return result
+
+    def backward_step(self, vision_grad_ref):
+        """Run backward pass on the vision model."""
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            backward_start = time.perf_counter()
+
+        # Retrieve gradient tensor
+        vision_grad = self._retrieve_gradient_tensor(vision_grad_ref)
+
+        # Apply backward
+        self._apply_vision_backward(vision_grad)
+
+        # Measure timing
+        backward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            backward_time_ms = (time.perf_counter() - backward_start) * 1000
+
+        return {"backward_time_ms": backward_time_ms}

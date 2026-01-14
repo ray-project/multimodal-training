@@ -125,6 +125,57 @@ for iteration in range(num_iterations):
 
 **Key Benefits**: Vision and text groups use different parallelization strategies (SP vs TP) on the same GPUs through collocation. Ray ObjectRefs handle cross-component data transfer automatically. Easy to reconfigure `num_actors` or strategies per component without framework changes.
 
+## Supported Models
+
+The framework supports multiple Qwen vision-language models. See [SUPPORTED_MODELS.md](SUPPORTED_MODELS.md) for detailed configuration options and architecture notes.
+
+| Model Family | Model Sizes | Recommended Parallelism | Notes |
+|--------------|-------------|------------------------|-------|
+| **Qwen2.5-VL** | 2B, 7B, 32B, 72B | Vision: SP or TP, Text: TP or AutoTP | Full parallelism support |
+| **Qwen3-VL** | 2B, 8B | Vision: SP only, Text: TP or AutoTP | Vision TP not supported (fused QKV) |
+| **Qwen3-VL-MoE** | 30B (3B active) | Vision: ZeRO or SP, Text: ZeRO only | AutoTP/TP not supported for MoE |
+
+### Parallelism Limitations
+
+**Qwen3-VL (non-MoE):**
+- Vision encoder uses fused QKV (`attn.qkv`) which is incompatible with DTensor column-wise sharding
+- Use sequence parallelism (`parallelism: "sequence"`) for the vision encoder
+
+**Qwen3-VL-MoE:**
+- DeepSpeed AutoTP and DTensor TP don't properly handle MoE gate layers
+- Use DeepSpeed ZeRO (`parallelism: "deepspeed"`) for the text decoder
+- Supports ZeRO-1, ZeRO-2, and ZeRO-3
+
+### Configuration Examples
+
+```yaml
+# Qwen2.5-VL (full parallelism support)
+vision:
+  model_type: "qwen2_5_vl"
+  parallelism: "sequence"  # or "tensor"
+text:
+  model_type: "qwen2_5_vl"
+  parallelism: "tensor"    # or "autotp"
+
+# Qwen3-VL (sequence parallel for vision)
+vision:
+  model_type: "qwen3_vl"
+  parallelism: "sequence"  # TP not supported
+text:
+  model_type: "qwen3_vl"
+  parallelism: "tensor"    # or "autotp"
+
+# Qwen3-VL-MoE (DeepSpeed ZeRO required)
+vision:
+  model_type: "qwen3_vl_moe"
+  parallelism: "deepspeed"
+  zero_stage: 3
+text:
+  model_type: "qwen3_vl_moe"
+  parallelism: "deepspeed"
+  zero_stage: 3
+```
+
 ## Case Study: Qwen2.5-VL
 
 ### Architecture Details
@@ -266,14 +317,14 @@ Below is a snippet illustrating the main configuration parameters:
 ...
 # Vision model configuration
 vision:
-  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
+  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"
   model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
   parallelism: "sequence"  # Options: "none", "tensor", "sequence", "deepspeed"
 ...
 
 # Text model configuration
 text:
-  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
+  model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"
   model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
   parallelism: "tensor"  # Options: "none", "tensor", "deepspeed", "autotp"
   autotp_size: null  # Optional tensor parallel size when using AutoTP (defaults to world size)

@@ -1,0 +1,71 @@
+# Qwen3-VL Test Configuration
+# 8 GPUs, parallel_size=8, dp_size=1
+# Uses Qwen3-VL-8B-Instruct for testing
+
+debug: false
+
+# Vision model configuration
+vision:
+  model_type: "qwen3_vl"
+  model_name: "Qwen/Qwen3-VL-8B-Instruct"
+  parallelism: "tensor"  # Options: "tensor", "sequence"
+  dtype: "bfloat16"
+  attention_backend: "flash_attention_2"
+  activation_checkpointing: true
+  autocast: true
+  zero_stage: 1
+
+# Text model configuration
+text:
+  model_type: "qwen3_vl"
+  model_name: "Qwen/Qwen3-VL-8B-Instruct"
+  parallelism: "tensor"  # Options: "tensor", "autotp"
+  dtype: "bfloat16"
+  attention_backend: "flash_attention_2"
+  activation_checkpointing: true
+  autocast: true
+  zero_stage: 1
+  autotp_size: null
+  tp_overlap_comm: false
+
+# Training configuration
+training:
+  batch_size: 4
+  learning_rate: 5e-05
+  num_epochs: 1
+  num_iterations: 5  # Short test run
+  warmup_steps: 2
+  warmup_ratio: 0.0
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  seed: 42
+  parallel_size: 8  # TP/SP size (must divide num_attention_heads)
+  dp_size: 1
+  collocate: true
+  clip_grad_norm: true
+  max_grad_norm: 1.0
+  no_checkpoint: true
+  log_interval: 1
+
+# Data configuration
+data:
+  datasets:
+    - mscoco2017_train_captions
+  data_registry:
+    mscoco2017_train_captions:
+      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_train_qwen.json"
+      data_path: "/mnt/local_storage/mscoco2017"
+    mscoco2017_val_captions:
+      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_val_qwen.json"
+      data_path: "/mnt/local_storage/mscoco2017"
+  num_workers: 4
+  pin_memory: true
+  data_flatten: true
+  min_pixels: 802816
+  max_pixels: 802816
+  force_fixed_size: true
+
+# DeepSpeed configuration
+deepspeed:
+  reduce_bucket_size: 500000000

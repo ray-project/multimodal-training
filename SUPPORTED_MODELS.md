@@ -100,6 +100,60 @@ Vision Encoder                    Text Decoder
 
 ---
 
+## Qwen3-VL-MoE (Mixture of Experts)
+
+### Model Variants
+| Model | Parameters | Active Params | HuggingFace ID |
+|-------|------------|---------------|----------------|
+| Qwen3-VL-30B-A3B | 30B total | ~3B active | `Qwen/Qwen3-VL-30B-A3B-Instruct` |
+
+### Architecture Overview
+Qwen3-VL-MoE uses a Mixture of Experts (MoE) architecture for the text decoder:
+- **Vision Encoder**: Same as Qwen3-VL-8B (27 layers, 1152 hidden size)
+- **Text Decoder**: 48 layers with MoE blocks
+  - 128 experts per MoE layer
+  - 8 experts active per token (top-k routing)
+  - ~3B active parameters per forward pass
+
+### Supported Parallelism Strategies
+
+| Vision Model | Text Model | Status | Notes |
+|--------------|------------|--------|-------|
+| DeepSpeed ZeRO | DeepSpeed ZeRO | Supported | Recommended for MoE models |
+| Sequence Parallel (SP) | DeepSpeed ZeRO | Supported | SP for vision, ZeRO for MoE text |
+| Any | AutoTP | Not Supported | AutoTP doesn't handle MoE gate layers |
+| Any | Tensor Parallel | Limited | TP only shards attention, not MoE experts |
+
+### Configuration Example
+```yaml
+vision:
+  model_type: "qwen3_vl_moe"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  parallelism: "deepspeed"  # DeepSpeed ZeRO recommended
+  zero_stage: 1  # Or 2/3 for more memory savings
+
+text:
+  model_type: "qwen3_vl_moe"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  parallelism: "deepspeed"  # DeepSpeed ZeRO required for MoE
+  zero_stage: 1
+```
+
+### Architecture Notes
+- Vision encoder identical to Qwen3-VL (fused QKV, DeepStack)
+- Text decoder uses sparse MoE blocks with top-k routing
+- Router selects 8 out of 128 experts per token
+- **DeepSpeed ZeRO required** - AutoTP/TP don't properly handle MoE gate layers
+- Standard DTensor TP only shards attention layers (not experts)
+
+### Memory Considerations
+Despite having 30B total parameters, only ~3B are active per forward pass. However:
+- All 128 experts must be loaded into memory
+- Memory requirements are similar to a dense 30B model
+- Use `batch_size: 1` for memory-constrained setups
+
+---
+
 ## Known Limitations
 
 ### Qwen3-VL Tensor Parallelism (Vision)
@@ -118,6 +172,7 @@ While Qwen3-VL's DeepStack features are computed and passed to the text model du
 |-------|---------------------|-------|
 | Qwen2.5-VL | 4.45.0 | First version with Qwen2.5-VL support |
 | Qwen3-VL | 4.57.0 | First version with Qwen3-VL support |
+| Qwen3-VL-MoE | 4.57.0 | First version with Qwen3-VL-MoE support |
 
 To check your transformers version:
 ```bash
