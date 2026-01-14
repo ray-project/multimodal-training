@@ -1,0 +1,55 @@
+debug: false
+vision:
+  model_type: qwen2_5_vl
+  model_name: Qwen/Qwen2.5-VL-3B-Instruct
+  parallelism: sequence
+  dtype: bfloat16
+  attention_backend: flash_attention_2
+  activation_checkpointing: true
+  autocast: true
+  zero_stage: 1
+text:
+  model_type: qwen2_5_vl
+  model_name: Qwen/Qwen2.5-VL-3B-Instruct
+  parallelism: autotp
+  dtype: bfloat16
+  attention_backend: flash_attention_2
+  activation_checkpointing: true
+  autocast: true
+  zero_stage: 1
+  autotp_size: null
+training:
+  batch_size: 1
+  learning_rate: 1.0e-05
+  num_epochs: 1
+  num_iterations: 5
+  warmup_steps: 2
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  weight_decay: 0
+  gradient_accumulation_steps: 1
+  seed: 42
+  parallel_size: 2
+  dp_size: 1
+  collocate: true
+  clip_grad_norm: false
+  max_grad_norm: 1.0
+  no_checkpoint: true
+  checkpoint_dir: /tmp/verify_hybrid_mm/hybrid_checkpoints
+  log_interval: 1
+  profile_time: false
+data:
+  datasets:
+  - verify_dataset
+  data_registry:
+    verify_dataset:
+      annotation_path: /home/ray/default/verify_hybrid_mm/data/verify_dataset.json
+      data_path: /home/ray/default/verify_hybrid_mm/data
+  num_workers: 2
+  pin_memory: true
+  data_flatten: true
+  min_pixels: 784
+  max_pixels: 50176
+  force_fixed_size: false
+deepspeed:
+  reduce_bucket_size: 500000000

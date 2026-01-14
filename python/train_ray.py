@@ -12,7 +12,16 @@ import hydra
 import ray
 import torch
 from omegaconf import DictConfig
-from ray.experimental.collective import create_collective_group
+
+# Handle ray.experimental import (may be moved in newer Ray versions)
+try:
+    from ray.experimental.collective import create_collective_group
+except ImportError:
+    try:
+        from ray.util.collective import create_collective_group
+    except ImportError:
+        # For Ray 2.51+, collectives are in ray.collective
+        from ray.collective import create_collective_group
 
 # Set log file path BEFORE importing logger module
 if "RAY_TRAIN_LOG_FILE" not in os.environ:
@@ -31,7 +40,7 @@ mp.set_start_method("spawn", force=True)
 
 logger = logging.getLogger(__name__)
 
-config_dir = str(Path(__file__).parent.parent.parent / "configs")
+config_dir = str(Path(__file__).parent.parent / "configs")
 
 
 def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict], dp_size: int = 1, parallel_size: int = 1) -> float:
