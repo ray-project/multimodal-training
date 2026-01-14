@@ -1182,3 +1182,402 @@ class QwenTextTrainer(QwenTextMixin, BaseTextTrainer):
     """Qwen2.5-VL text trainer."""
 
     pass
+
+
+class Qwen3TextMixin:
+    """Qwen3-VL text model helpers with DeepStack support."""
+
+    def _load_model_config(self, model_name):
+        """Load Qwen3-VL model config."""
+        from ..models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+        return Qwen3VLConfig.from_pretrained(model_name, trust_remote_code=True)
+
+    def _create_model_and_lm_head(self, model_config):
+        """Create Qwen3-VL text model and lm_head."""
+        from ..models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+
+        model = Qwen3VLTextModel._from_config(model_config.text_config)
+        lm_head = nn.Linear(model_config.text_config.hidden_size, model_config.text_config.vocab_size, bias=False)
+        return model, lm_head
+
+    def _get_embedding_module(self, model):
+        """Get embedding module for Qwen3."""
+        return model.embed_tokens
+
+    def _get_transformer_layers(self, model):
+        """Get transformer layers for Qwen3."""
+        return model.layers
+
+    def _get_tensor_parallel_mapping(self):
+        """Get tensor parallel mapping for Qwen3."""
+        from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
+        return {
+            "self_attn.q_proj": ColwiseParallel(),
+            "self_attn.k_proj": ColwiseParallel(),
+            "self_attn.v_proj": ColwiseParallel(),
+            "self_attn.o_proj": RowwiseParallel(),
+            "mlp.gate_proj": ColwiseParallel(),
+            "mlp.up_proj": ColwiseParallel(),
+            "mlp.down_proj": RowwiseParallel(),
+        }
+
+
+@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
+class Qwen3TextTrainer(Qwen3TextMixin, BaseTextTrainer):
+    """Qwen3-VL text trainer with DeepStack support."""
+
+    def __init__(self, config, rank: int):
+        super().__init__(config, rank)
+        self.deepstack_features = None  # Store DeepStack features for backward pass
+
+    def forward_step(self, vision_embeddings_ref, iteration: int = -1):
+        """
+        Run one forward pass on the Qwen3 text model with DeepStack features.
+
+        Args:
+            vision_embeddings_ref: Ray object reference or dict from Qwen3VisionTrainer
+                                   Contains 'vision_embeddings' and 'deepstack_features'
+            iteration: Training iteration number
+
+        Returns:
+            Dict with "loss" and optionally "forward_time_ms"
+        """
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            forward_start = time.perf_counter()
+
+        self._current_iteration = iteration
+        logger.debug(f"[r{self.rank}] Qwen3 Text forward_step: iteration={iteration}")
+
+        # Get vision data
+        if isinstance(vision_embeddings_ref, ray.ObjectRef):
+            vision_data = ray.get(vision_embeddings_ref)
+        else:
+            vision_data = vision_embeddings_ref
+
+        if not isinstance(vision_data, dict):
+            raise RuntimeError(
+                f"[r{self.rank}] Expected vision_data to be dict, got type {type(vision_data)}"
+            )
+
+        vision_embeddings_data = vision_data.get("vision_embeddings")
+        deepstack_features_data = vision_data.get("deepstack_features")
+        vision_sample_index = vision_data.get("sample_index")
+        vision_iteration = vision_data.get("iteration")
+
+        # Verify iteration matches
+        if vision_iteration != iteration:
+            raise RuntimeError(
+                f"[r{self.rank}] Iteration mismatch! Vision={vision_iteration}, text={iteration}"
+            )
+
+        logger.debug(
+            f"[r{self.rank}] Received from Qwen3 vision: iteration={vision_iteration}, "
+            f"deepstack_features={len(deepstack_features_data) if deepstack_features_data else 0}"
+        )
+
+        # Handle CUDA IPC transfer for vision embeddings
+        if isinstance(vision_embeddings_data, dict) and "use_ipc" in vision_embeddings_data:
+            transfer_request = TensorTransferRequest.from_dict(vision_embeddings_data)
+            receiver_gpu_id = get_physical_gpu_id()
+            vision_embeddings = receive_tensor(transfer_request, receiver_gpu_id)
+        else:
+            vision_embeddings = vision_embeddings_data
+
+        # Handle CUDA IPC transfer for DeepStack features
+        deepstack_features = None
+        if deepstack_features_data is not None:
+            deepstack_features = []
+            for ds_data in deepstack_features_data:
+                if isinstance(ds_data, dict) and "use_ipc" in ds_data:
+                    ds_transfer = TensorTransferRequest.from_dict(ds_data)
+                    ds_tensor = receive_tensor(ds_transfer, get_physical_gpu_id())
+                else:
+                    ds_tensor = ds_data
+                deepstack_features.append(ds_tensor)
+
+        self._vision_grad_owner_rank = self.rank
+        vision_forward_time_ms = vision_data.get("forward_time_ms", 0.0)
+
+        loss = self._forward_step_impl_with_deepstack(
+            vision_embeddings, deepstack_features, vision_sample_index, iteration
+        )
+
+        result = {"loss": loss}
+        if profile_time:
+            torch.cuda.synchronize()
+            forward_time_ms = (time.perf_counter() - forward_start) * 1000
+            result["forward_time_ms"] = forward_time_ms
+            result["vision_forward_time_ms"] = vision_forward_time_ms
+
+        return result
+
+    def _forward_step_impl_with_deepstack(
+        self, vision_embeddings, deepstack_features, vision_sample_index=None, iteration=-1
+    ):
+        """
+        Forward pass implementation with DeepStack feature injection.
+
+        Args:
+            vision_embeddings: Vision embeddings tensor
+            deepstack_features: List of DeepStack feature tensors
+            vision_sample_index: Sample index from vision trainer
+            iteration: Training iteration number
+
+        Returns:
+            Loss value
+        """
+        # Get next batch
+        try:
+            batch = next(self.data_iterator)
+        except StopIteration:
+            self.data_iterator = iter(self.dataloader)
+            batch = next(self.data_iterator)
+
+        # Verify sample index
+        if "sample_index" in batch:
+            text_sample_index = batch["sample_index"]
+            if isinstance(text_sample_index, torch.Tensor):
+                text_sample_index = (
+                    text_sample_index.item() if text_sample_index.numel() == 1 else text_sample_index.tolist()
+                )
+            if vision_sample_index is not None and text_sample_index != vision_sample_index:
+                raise RuntimeError(
+                    f"[r{self.rank}] Sample index mismatch at iteration {iteration}! "
+                    f"Vision={vision_sample_index}, text={text_sample_index}"
+                )
+
+        # Move tensors to CUDA
+        device = torch.device("cuda:0")
+        if isinstance(batch, dict):
+            for key in ("input_ids", "attention_mask", "labels", "position_ids"):
+                if key in batch and isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device, non_blocking=True)
+
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        position_ids = batch.get("position_ids")
+
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+
+        # Verify position_ids
+        if position_ids is None:
+            raise RuntimeError(f"[r{self.rank}] position_ids is None!")
+        if position_ids.dim() != 3 or position_ids.shape[0] != 3:
+            raise RuntimeError(
+                f"[r{self.rank}] position_ids should have shape [3, batch_size, seq_len], got {position_ids.shape}"
+            )
+
+        attention_mask = None
+
+        logger.debug(
+            f"[r{self.rank}] Qwen3 Text forward_step: input_ids={input_ids.shape}, "
+            f"vision_embeddings={vision_embeddings.shape}"
+        )
+
+        if vision_embeddings.device != device:
+            vision_embeddings = vision_embeddings.to(device, non_blocking=True)
+
+        if vision_embeddings.dim() == 2:
+            vision_embeddings = vision_embeddings.unsqueeze(0)
+
+        # Enable gradient computation
+        vision_embeddings = vision_embeddings.detach().clone().requires_grad_(True)
+        vision_embeddings.retain_grad()
+        self.vision_embeddings = vision_embeddings
+
+        # Process DeepStack features
+        if deepstack_features is not None:
+            processed_deepstack = []
+            for ds_feat in deepstack_features:
+                if ds_feat.device != device:
+                    ds_feat = ds_feat.to(device, non_blocking=True)
+                if ds_feat.dim() == 2:
+                    ds_feat = ds_feat.unsqueeze(0)
+                ds_feat = ds_feat.detach().clone().requires_grad_(True)
+                ds_feat.retain_grad()
+                processed_deepstack.append(ds_feat)
+            self.deepstack_features = processed_deepstack
+        else:
+            self.deepstack_features = None
+
+        # Get actual model
+        actual_model = self._get_actual_model()
+
+        # Get text embeddings
+        inputs_embeds = actual_model.embed_tokens(input_ids)
+
+        # Replace <image> tokens with vision embeddings
+        IMAGE_TOKEN_ID = 151655
+        visual_pos_mask = input_ids == IMAGE_TOKEN_ID  # Shape: (batch, seq_len)
+        image_mask = visual_pos_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        num_image_tokens_in_input = visual_pos_mask.sum().item()
+
+        if num_image_tokens_in_input == 0:
+            raise RuntimeError(f"[r{self.rank}] No <image> tokens found in input_ids!")
+
+        vision_embeds_flat = vision_embeddings.reshape(-1, vision_embeddings.shape[-1])
+        if vision_embeds_flat.shape[0] != num_image_tokens_in_input:
+            raise RuntimeError(
+                f"[r{self.rank}] Mismatch: {vision_embeds_flat.shape[0]} vision embeddings but "
+                f"{num_image_tokens_in_input} <image> tokens"
+            )
+
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, vision_embeds_flat)
+
+        # Store visual_pos_mask for DeepStack processing
+        self.visual_pos_mask = visual_pos_mask
+
+        # Get autocast context
+        autocast_context = self._get_autocast_context()
+
+        # Forward pass with DeepStack features
+        with autocast_context:
+            # Note: Qwen3-VL text model accepts deepstack_visual_embeds parameter
+            # We pass it if the model supports it
+            forward_kwargs = {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            }
+
+            # Add DeepStack features and visual position mask if model supports them
+            if self.deepstack_features is not None:
+                # Flatten DeepStack features for model input
+                deepstack_embeds = [ds.reshape(-1, ds.shape[-1]) for ds in self.deepstack_features]
+                forward_kwargs["deepstack_visual_embeds"] = deepstack_embeds
+                # visual_pos_masks indicates which positions are visual tokens (for DeepStack injection)
+                forward_kwargs["visual_pos_masks"] = self.visual_pos_mask
+
+            text_outputs = self.model(**forward_kwargs)
+            logits = self.lm_head(text_outputs.last_hidden_state)
+
+            logger.debug(f"[r{self.rank}] Qwen3 Text logits shape={logits.shape}")
+
+            # Compute loss
+            parallelism = self.config.get("parallelism")
+            tp_group = getattr(self.model, "tp_group", None)
+            use_tp_loss = tp_group is not None and (
+                parallelism == "tensor" or (parallelism == "autotp" and self.config.get("use_vocab_parallel", True))
+            )
+            if use_tp_loss:
+                import torch.distributed as dist
+
+                tp_rank = dist.get_rank(self.model.tp_group)
+                tp_world_size = dist.get_world_size(self.model.tp_group)
+                loss = vocab_parallel_causal_cross_entropy(
+                    logits,
+                    labels,
+                    self.model.tp_group,
+                    tp_rank,
+                    tp_world_size,
+                    ignore_index=-100,
+                )
+            else:
+                shift_logits = logits[:, :-1, :].contiguous().float()
+                shift_labels = labels[:, 1:].contiguous()
+                loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        self.loss = loss
+        logger.debug(f"[r{self.rank}] Qwen3 Text loss={loss.item():.4f}")
+
+        return loss
+
+    def backward_step(self):
+        """
+        Run backward pass on the Qwen3 text model with DeepStack gradient support.
+
+        Returns:
+            Dict with gradients for vision embeddings and DeepStack features.
+        """
+        profile_time = self.config.get("profile_time", False)
+        if profile_time:
+            backward_start = time.perf_counter()
+
+        logger.debug(f"[r{self.rank}] Qwen3 Text backward_step: computing gradients")
+
+        # Backward pass
+        if self.use_deepspeed and self.deepspeed_engine is not None:
+            self.deepspeed_engine.backward(self.loss)
+        else:
+            self.loss.backward()
+
+        backward_time_ms = 0.0
+        if profile_time:
+            torch.cuda.synchronize()
+            backward_time_ms = (time.perf_counter() - backward_start) * 1000
+
+        # Extract vision embeddings gradient
+        if self.vision_embeddings is None or self.vision_embeddings.grad is None:
+            raise RuntimeError(f"[r{self.rank}] vision_embeddings or its gradient is None!")
+
+        vision_grad = self.vision_embeddings.grad
+        if vision_grad.dim() == 3 and vision_grad.shape[0] == 1:
+            vision_grad = vision_grad.squeeze(0)
+        grad_to_send = vision_grad.detach().clone()
+
+        # Extract DeepStack gradients
+        deepstack_grads = None
+        if self.deepstack_features is not None:
+            deepstack_grads = []
+            for ds_feat in self.deepstack_features:
+                if ds_feat.grad is not None:
+                    ds_grad = ds_feat.grad
+                    if ds_grad.dim() == 3 and ds_grad.shape[0] == 1:
+                        ds_grad = ds_grad.squeeze(0)
+                    deepstack_grads.append(ds_grad.detach().clone())
+                else:
+                    deepstack_grads.append(None)
+
+        # Clear saved tensors
+        self.loss = None
+        self.vision_embeddings = None
+        self.deepstack_features = None
+
+        # Build result
+        def _build_result(grad_data, ds_grads):
+            result = {
+                "grad": grad_data,
+                "deepstack_grads": ds_grads,
+            }
+            if profile_time:
+                result["backward_time_ms"] = backward_time_ms
+            return result
+
+        # Handle CUDA IPC transfer
+        if self.use_ipc and self.receiver_gpu_ids is not None:
+            sender_gpu_id = get_physical_gpu_id()
+
+            # Transfer embeddings gradient
+            transfer_request = prepare_tensor_for_transfer(
+                grad_to_send,
+                receiver_gpu_ids=self.receiver_gpu_ids,
+                sender_gpu_id=sender_gpu_id,
+                use_ipc_if_same_gpu=True,
+            )
+            grad_data = transfer_request.to_dict()
+
+            # Transfer DeepStack gradients
+            if deepstack_grads is not None:
+                ds_grad_transfers = []
+                for ds_grad in deepstack_grads:
+                    if ds_grad is not None:
+                        ds_transfer = prepare_tensor_for_transfer(
+                            ds_grad,
+                            receiver_gpu_ids=self.receiver_gpu_ids,
+                            sender_gpu_id=sender_gpu_id,
+                            use_ipc_if_same_gpu=True,
+                        )
+                        ds_grad_transfers.append(ds_transfer.to_dict())
+                    else:
+                        ds_grad_transfers.append(None)
+                deepstack_grads = ds_grad_transfers
+
+            return _build_result(grad_data, deepstack_grads)
+        else:
+            return _build_result(grad_to_send, deepstack_grads)

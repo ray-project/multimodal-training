@@ -22,9 +22,9 @@ from .checkpoint import find_latest_checkpoint, load_epoch_checkpoint, save_epoc
 from .ray.actor_group import ActorGroup
 from .ray.logger import setup_logging
 from .ray.tensor_transfer import gather_gpu_ids
-from .ray.text import QwenTextTrainer
+from .ray.text import QwenTextTrainer, Qwen3TextTrainer
 from .ray.utils import initialize_ray
-from .ray.vision import QwenVisionTrainer
+from .ray.vision import QwenVisionTrainer, Qwen3VisionTrainer
 
 # See: https://docs.ray.io/en/latest/ray-core/patterns/fork-new-processes.html
 mp.set_start_method("spawn", force=True)
@@ -126,6 +126,8 @@ def get_vision_trainer_class(model_type: str):
     """Get the appropriate vision trainer class based on model type."""
     if model_type == "qwen2_5_vl":
         return QwenVisionTrainer
+    elif model_type == "qwen3_vl":
+        return Qwen3VisionTrainer
     else:
         raise ValueError(f"Unsupported vision model_type: {model_type}")
 
@@ -134,6 +136,8 @@ def get_text_trainer_class(model_type: str):
     """Get the appropriate text trainer class based on model type."""
     if model_type == "qwen2_5_vl":
         return QwenTextTrainer
+    elif model_type == "qwen3_vl":
+        return Qwen3TextTrainer
     else:
         raise ValueError(f"Unsupported text model_type: {model_type}")
 
