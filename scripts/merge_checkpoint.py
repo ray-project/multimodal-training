@@ -17,6 +17,8 @@ import argparse
 import json
 import logging
 import os
+import sys
+from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoConfig
@@ -26,6 +28,90 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _add_ms_swift_to_path():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    ms_swift_path = os.path.join(repo_root, "ms-swift")
+    if os.path.isdir(ms_swift_path) and ms_swift_path not in sys.path:
+        sys.path.insert(0, ms_swift_path)
+
+
+def _normalize_hf_state_dict(state_dict: Dict[str, torch.Tensor], mapping: Dict[str, str]) -> Dict[str, torch.Tensor]:
+    if not mapping:
+        return state_dict
+    normalized = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for old_prefix, new_prefix in mapping.items():
+            if key.startswith(old_prefix):
+                new_key = key.replace(old_prefix, new_prefix, 1)
+                break
+        normalized[new_key] = value
+    return normalized
+
+
+def _resolve_ms_swift_mapping(
+    model_name: str, model_type: Optional[str]
+) -> Tuple[str, Dict[str, str], Dict[str, str], type]:
+    _add_ms_swift_to_path()
+    from swift.model import get_model_info_meta
+    from swift.megatron.model.register import get_megatron_model_meta
+
+    model_info, _ = get_model_info_meta(model_name, model_type=model_type, use_hf=True, download_model=False)
+    megatron_meta = get_megatron_model_meta(model_info.model_type)
+    if megatron_meta is None:
+        raise ValueError(f"No ms-swift Megatron metadata found for model_type='{model_info.model_type}'.")
+    if megatron_meta.visual_cls is None or not hasattr(megatron_meta.visual_cls, "module_mapping"):
+        raise ValueError(f"No visual module mapping found for model_type='{model_info.model_type}'.")
+    module_mapping = megatron_meta.visual_cls.module_mapping
+    bridge_cls = megatron_meta.bridge_cls
+    hf_state_dict_mapping = getattr(bridge_cls, "hf_state_dict_mapping", {}) or {}
+    return model_info.model_type, module_mapping, hf_state_dict_mapping, bridge_cls
+
+
+def _get_text_prefix(bridge_cls: type) -> str:
+    hf_layers_prefix = getattr(bridge_cls, "hf_layers_prefix", "model.layers")
+    if "." in hf_layers_prefix:
+        return hf_layers_prefix.rsplit(".", 1)[0]
+    return ""
+
+
+def _build_full_state_dict(
+    vision_state_dict: Dict[str, torch.Tensor],
+    text_state_dict: Dict[str, torch.Tensor],
+    visual_prefix: str,
+    text_prefix: str,
+) -> Dict[str, torch.Tensor]:
+    full_state_dict = {}
+
+    for key, value in vision_state_dict.items():
+        if key.startswith(f"{visual_prefix}."):
+            full_key = key
+        elif key.startswith("visual.") and visual_prefix.endswith("visual"):
+            full_key = f"{visual_prefix}.{key[len('visual.'):]}"
+        else:
+            full_key = f"{visual_prefix}.{key}"
+        full_state_dict[full_key] = value
+
+    for key, value in text_state_dict.items():
+        if key.startswith("lm_head."):
+            full_state_dict[key] = value
+            continue
+
+        if text_prefix and key.startswith(f"{text_prefix}."):
+            full_key = key
+        else:
+            cleaned_key = key
+            if cleaned_key.startswith("language_model."):
+                cleaned_key = cleaned_key[len("language_model.") :]
+            elif cleaned_key.startswith("model."):
+                cleaned_key = cleaned_key[len("model.") :]
+            full_key = f"{text_prefix}.{cleaned_key}" if text_prefix else cleaned_key
+
+        full_state_dict[full_key] = value
+
+    return full_state_dict
 
 
 def load_and_merge_sharded_weights(checkpoint_dir: str, num_ranks: int, component: str):
@@ -145,6 +231,7 @@ def merge_checkpoint(
     model_name: str,
     parallel_size: int = 1,
     trust_remote_code: bool = True,
+    model_type: Optional[str] = None,
 ):
     """
     Merge separately saved vision and text checkpoints back into a full HuggingFace checkpoint.
@@ -171,20 +258,34 @@ def merge_checkpoint(
     text_dir = os.path.join(checkpoint_dir, "text")
     text_state_dict = load_and_merge_sharded_weights(text_dir, parallel_size, "text")
 
-    # Combine into full model state dict
-    # Vision weights need "visual." prefix to match HuggingFace format
-    # Text weights need "language_model." prefix (or "model." for older checkpoints)
-    full_state_dict = {}
+    # Combine into full model state dict using ms-swift canonical mapping
+    try:
+        resolved_model_type, module_mapping, hf_state_dict_mapping, bridge_cls = _resolve_ms_swift_mapping(
+            model_name, model_type=model_type
+        )
+        normalized_vision = _normalize_hf_state_dict(vision_state_dict, hf_state_dict_mapping)
+        normalized_text = _normalize_hf_state_dict(text_state_dict, hf_state_dict_mapping)
+        text_prefix = _get_text_prefix(bridge_cls)
+        if len(module_mapping) > 1:
+            logger.warning(
+                f"Multiple visual mappings found ({module_mapping}); using first entry for merge output."
+            )
+        visual_prefix = list(module_mapping.keys())[0]
+        full_state_dict = _build_full_state_dict(normalized_vision, normalized_text, visual_prefix, text_prefix)
+        logger.info(f"ms-swift model_type: {resolved_model_type}")
+        logger.info(f"ms-swift visual mapping: {module_mapping}")
+    except Exception as exc:
+        logger.warning(f"Falling back to legacy prefix merge (ms-swift mapping unavailable): {exc}")
+        full_state_dict = {}
 
-    for key, value in vision_state_dict.items():
-        full_state_dict[f"visual.{key}"] = value
+        for key, value in vision_state_dict.items():
+            full_state_dict[f"visual.{key}"] = value
 
-    for key, value in text_state_dict.items():
-        # Add language_model. prefix if not already present
-        if not key.startswith("language_model.") and not key.startswith("model."):
-            full_state_dict[f"language_model.{key}"] = value
-        else:
-            full_state_dict[key] = value
+        for key, value in text_state_dict.items():
+            if not key.startswith("language_model.") and not key.startswith("model."):
+                full_state_dict[f"language_model.{key}"] = value
+            else:
+                full_state_dict[key] = value
 
     logger.info(f"Full model state dict: {len(full_state_dict)} tensors")
 
@@ -267,6 +368,12 @@ def main():
         action="store_true",
         help="Do not trust remote code when loading config",
     )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        help="Optional ms-swift model_type override (e.g., 'qwen2_5_vl')",
+    )
 
     args = parser.parse_args()
 
@@ -276,6 +383,7 @@ def main():
         model_name=args.model_name,
         parallel_size=args.parallel_size,
         trust_remote_code=not args.no_trust_remote_code,
+        model_type=args.model_type,
     )
 
 

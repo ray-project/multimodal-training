@@ -17,6 +17,8 @@ The training framework splits VLMs into separate vision and text components that
 **Script**: `scripts/split_checkpoint.py`
 
 Loads a HuggingFace Qwen2.5-VL checkpoint and splits it into separate vision and text model weights.
+The split uses ms-swift's canonical mapping (bridge + visual module mapping) so that vision/text
+boundaries follow the model registry rather than hard-coded prefixes.
 
 **Usage**:
 ```bash
@@ -29,6 +31,7 @@ python scripts/split_checkpoint.py \
 - `--model-name`: HuggingFace model name or path (e.g., `Qwen/Qwen2.5-VL-7B-Instruct`)
 - `--output-dir`: Directory to save the split checkpoints
 - `--no-trust-remote-code`: Don't trust remote code when loading (optional)
+- `--model-type`: Optional ms-swift model_type override (e.g., `qwen2_5_vl`) if auto-detection fails
 
 **Output**:
 ```
@@ -113,6 +116,8 @@ The training script will automatically:
 **Script**: `scripts/merge_checkpoint.py`
 
 Merges separately saved vision and text checkpoints (created during training) back into a unified HuggingFace format.
+The merge uses ms-swift's canonical mapping to restore `model.visual.*` and `model.language_model.*` keys so the
+result is compatible with `AutoModelForVision2Seq`.
 
 **Usage**:
 ```bash
@@ -129,6 +134,7 @@ python scripts/merge_checkpoint.py \
 - `--model-name`: Original HuggingFace model name for config reference
 - `--parallel-size`: Number of parallel ranks (for merging sharded weights)
 - `--no-trust-remote-code`: Don't trust remote code when loading config (optional)
+- `--model-type`: Optional ms-swift model_type override (e.g., `qwen2_5_vl`) if auto-detection fails
 
 **Input Structure**:
 ```

@@ -14,6 +14,8 @@ Usage:
 import argparse
 import logging
 import os
+import sys
+from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoConfig, AutoModelForVision2Seq
@@ -25,7 +27,100 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool = True):
+def _add_ms_swift_to_path():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    ms_swift_path = os.path.join(repo_root, "ms-swift")
+    if os.path.isdir(ms_swift_path) and ms_swift_path not in sys.path:
+        sys.path.insert(0, ms_swift_path)
+
+
+def _normalize_hf_state_dict(state_dict: Dict[str, torch.Tensor], mapping: Dict[str, str]) -> Dict[str, torch.Tensor]:
+    if not mapping:
+        return state_dict
+    normalized = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for old_prefix, new_prefix in mapping.items():
+            if key.startswith(old_prefix):
+                new_key = key.replace(old_prefix, new_prefix, 1)
+                break
+        normalized[new_key] = value
+    return normalized
+
+
+def _resolve_ms_swift_mapping(
+    model_name: str, model_type: Optional[str], use_hf: bool
+) -> Tuple[str, Dict[str, str], Dict[str, str], type]:
+    _add_ms_swift_to_path()
+    from swift.model import get_model_info_meta
+    from swift.megatron.model.register import get_megatron_model_meta
+
+    model_info, _ = get_model_info_meta(model_name, model_type=model_type, use_hf=use_hf, download_model=False)
+    megatron_meta = get_megatron_model_meta(model_info.model_type)
+    if megatron_meta is None:
+        raise ValueError(f"No ms-swift Megatron metadata found for model_type='{model_info.model_type}'.")
+    if megatron_meta.visual_cls is None or not hasattr(megatron_meta.visual_cls, "module_mapping"):
+        raise ValueError(f"No visual module mapping found for model_type='{model_info.model_type}'.")
+    module_mapping = megatron_meta.visual_cls.module_mapping
+    bridge_cls = megatron_meta.bridge_cls
+    hf_state_dict_mapping = getattr(bridge_cls, "hf_state_dict_mapping", {}) or {}
+    return model_info.model_type, module_mapping, hf_state_dict_mapping, bridge_cls
+
+
+def _get_text_prefix(bridge_cls: type) -> str:
+    hf_layers_prefix = getattr(bridge_cls, "hf_layers_prefix", "model.layers")
+    if "." in hf_layers_prefix:
+        return hf_layers_prefix.rsplit(".", 1)[0]
+    return ""
+
+
+def _strip_text_prefixes(state_dict: Dict[str, torch.Tensor], text_prefix: str) -> Dict[str, torch.Tensor]:
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key
+        if text_prefix and new_key.startswith(f"{text_prefix}."):
+            new_key = new_key[len(text_prefix) + 1 :]
+        elif new_key.startswith("language_model."):
+            new_key = new_key[len("language_model.") :]
+        elif new_key.startswith("model."):
+            new_key = new_key[len("model.") :]
+        cleaned[new_key] = value
+    return cleaned
+
+
+def _split_with_mapping(
+    state_dict: Dict[str, torch.Tensor],
+    module_mapping: Dict[str, str],
+    text_prefix: str,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    vision_state_dict = {}
+    text_state_dict = {}
+    vision_prefixes = list(module_mapping.keys())
+
+    for key, value in state_dict.items():
+        matched_prefix = None
+        for prefix in vision_prefixes:
+            if key == prefix or key.startswith(f"{prefix}."):
+                matched_prefix = prefix
+                break
+        if matched_prefix is not None:
+            new_key = key[len(matched_prefix) :]
+            if new_key.startswith("."):
+                new_key = new_key[1:]
+            vision_state_dict[new_key] = value
+        else:
+            text_state_dict[key] = value
+
+    text_state_dict = _strip_text_prefixes(text_state_dict, text_prefix)
+    return vision_state_dict, text_state_dict
+
+
+def split_checkpoint(
+    model_name: str,
+    output_dir: str,
+    trust_remote_code: bool = True,
+    model_type: Optional[str] = None,
+):
     """
     Load a Qwen2.5-VL checkpoint from HuggingFace and split it into vision and text components.
 
@@ -58,45 +153,44 @@ def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool =
     state_dict = model.state_dict()
     logger.info(f"Total parameters in model: {len(state_dict)} tensors")
 
-    # Split state dict into vision and text components
-    # Keys from AutoModelForVision2Seq:
-    #   - model.visual.* -> vision model
-    #   - model.language_model.* -> text model
-    #   - lm_head.* -> text model (separate from embeddings when tie_word_embeddings=False)
-    #   - visual.* -> vision model (for some model versions)
-    #   - language_model.* -> text model (for some model versions)
-    vision_state_dict = {}
-    text_state_dict = {}
+    # Split state dict using ms-swift canonical mapping
+    resolved_model_type = None
+    try:
+        resolved_model_type, module_mapping, hf_state_dict_mapping, bridge_cls = _resolve_ms_swift_mapping(
+            model_name, model_type=model_type, use_hf=True
+        )
+        text_prefix = _get_text_prefix(bridge_cls)
+        normalized_state_dict = _normalize_hf_state_dict(state_dict, hf_state_dict_mapping)
+        vision_state_dict, text_state_dict = _split_with_mapping(normalized_state_dict, module_mapping, text_prefix)
+        logger.info(f"ms-swift model_type: {resolved_model_type}")
+        logger.info(f"ms-swift visual mapping: {module_mapping}")
+    except Exception as exc:
+        logger.warning(f"Falling back to prefix-based split (ms-swift mapping unavailable): {exc}")
+        vision_state_dict = {}
+        text_state_dict = {}
 
-    for key, value in state_dict.items():
-        # Handle vision model weights
-        if key.startswith("model.visual."):
-            # Vision model weights - remove "model.visual." prefix
-            new_key = key[len("model.visual.") :]
-            vision_state_dict[new_key] = value
-        elif key.startswith("visual."):
-            # Alternative format: remove "visual." prefix
-            new_key = key[len("visual.") :]
-            vision_state_dict[new_key] = value
-        # Handle text model and lm_head weights
-        elif key.startswith("model.language_model."):
-            # Text model weights - remove "model.language_model." prefix
-            new_key = key[len("model.language_model.") :]
-            text_state_dict[new_key] = value
-        elif key.startswith("language_model."):
-            # Alternative format: remove "language_model." prefix
-            new_key = key[len("language_model.") :]
-            text_state_dict[new_key] = value
-        elif key.startswith("lm_head."):
-            # lm_head weights - keep as is (important for untied embeddings)
-            text_state_dict[key] = value
-        elif key.startswith("model."):
-            # Other model. prefixed keys go to text
-            new_key = key[len("model.") :]
-            text_state_dict[new_key] = value
-        else:
-            # Other keys go to text
-            text_state_dict[key] = value
+        for key, value in state_dict.items():
+            # Handle vision model weights
+            if key.startswith("model.visual."):
+                new_key = key[len("model.visual.") :]
+                vision_state_dict[new_key] = value
+            elif key.startswith("visual."):
+                new_key = key[len("visual.") :]
+                vision_state_dict[new_key] = value
+            # Handle text model and lm_head weights
+            elif key.startswith("model.language_model."):
+                new_key = key[len("model.language_model.") :]
+                text_state_dict[new_key] = value
+            elif key.startswith("language_model."):
+                new_key = key[len("language_model.") :]
+                text_state_dict[new_key] = value
+            elif key.startswith("lm_head."):
+                text_state_dict[key] = value
+            elif key.startswith("model."):
+                new_key = key[len("model.") :]
+                text_state_dict[new_key] = value
+            else:
+                text_state_dict[key] = value
 
     logger.info(f"Vision model: {len(vision_state_dict)} tensors")
     logger.info(f"Text model: {len(text_state_dict)} tensors")
@@ -138,6 +232,7 @@ def split_checkpoint(model_name: str, output_dir: str, trust_remote_code: bool =
         "text_checkpoint": text_path,
         "vision_num_params": len(vision_state_dict),
         "text_num_params": len(text_state_dict),
+        "model_type": resolved_model_type or getattr(config, "model_type", None),
     }
 
     metadata_path = os.path.join(output_dir, "split_metadata.json")
@@ -175,6 +270,12 @@ def main():
         action="store_true",
         help="Do not trust remote code when loading the model",
     )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        help="Optional ms-swift model_type override (e.g., 'qwen2_5_vl')",
+    )
 
     args = parser.parse_args()
 
@@ -182,6 +283,7 @@ def main():
         model_name=args.model_name,
         output_dir=args.output_dir,
         trust_remote_code=not args.no_trust_remote_code,
+        model_type=args.model_type,
     )
 
 

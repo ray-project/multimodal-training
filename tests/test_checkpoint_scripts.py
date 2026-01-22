@@ -298,17 +298,17 @@ def test_full_merge_pipeline(temp_dir):
     for key in trained_text:
         assert torch.equal(merged_text[key], trained_text[key])
 
-    # 4. Combine into full state dict (with visual. and language_model. prefixes)
+    # 4. Combine into full state dict (with model.visual and model.language_model prefixes)
     full_state_dict = {}
     for key, value in merged_vision.items():
-        full_state_dict[f"visual.{key}"] = value
+        full_state_dict[f"model.visual.{key}"] = value
     for key, value in merged_text.items():
-        # Add language_model. prefix for HuggingFace compatibility
-        full_state_dict[f"language_model.{key}"] = value
+        # Add model.language_model. prefix for HuggingFace compatibility
+        full_state_dict[f"model.language_model.{key}"] = value
 
     # Verify structure
-    assert "visual.blocks.0.attn.q_proj.weight" in full_state_dict
-    assert "language_model.embed_tokens.weight" in full_state_dict
+    assert "model.visual.blocks.0.attn.q_proj.weight" in full_state_dict
+    assert "model.language_model.embed_tokens.weight" in full_state_dict
     assert len(full_state_dict) == len(vision_state) + len(text_state)
 
 
