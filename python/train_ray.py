@@ -138,6 +138,29 @@ def get_text_trainer_class(model_type: str):
         raise ValueError(f"Unsupported text model_type: {model_type}")
 
 
+def normalize_component_config(component_config: dict, component_name: str) -> dict:
+    """Normalize engine selection and engine_config for a component."""
+    normalized = dict(component_config)
+    engine_config = dict(normalized.get("engine_config", {}))
+
+    # Promote legacy engine-specific keys into engine_config for consistency
+    for key in ["zero_stage", "autotp_size", "tp_overlap_comm", "use_vocab_parallel", "reduce_bucket_size"]:
+        if key in normalized and key not in engine_config:
+            engine_config[key] = normalized[key]
+
+    normalized["engine_config"] = engine_config
+
+    # Infer engine if not set
+    if normalized.get("engine") is None:
+        parallelism = normalized.get("parallelism", "none")
+        if parallelism in ["sequence", "deepspeed", "autotp"]:
+            normalized["engine"] = "deepspeed"
+        else:
+            normalized["engine"] = "native"
+
+    return normalized
+
+
 @hydra.main(config_path=config_dir, config_name="train", version_base=None)
 def main(cfg: DictConfig):
     # Set up our custom logging - Hydra has already configured its own logging by this point
@@ -162,6 +185,10 @@ def main(cfg: DictConfig):
     if "deepspeed" in cfg:
         vision_config.update(dict(cfg.deepspeed))
         text_config.update(dict(cfg.deepspeed))
+
+    # Normalize component configs for engine selection
+    vision_config = normalize_component_config(vision_config, "vision")
+    text_config = normalize_component_config(text_config, "text")
 
     # Add DP/TP configuration for proper parallelism setup
     dp_size = cfg.training.dp_size

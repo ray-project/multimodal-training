@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import torch
 from transformers import set_seed
 
+from ..backends import get_backend_strategy
 from .actor import RayActor
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ class Trainer(RayActor):
     def __init__(self, config, rank: int):
         RayActor.__init__(self, rank)
         self.config = config
+        self.backend = None
 
         seed = config["seed"]
         set_seed(seed)
@@ -221,6 +223,31 @@ class Trainer(RayActor):
             "float32": torch.float32,
         }
         return dtype_map.get(dtype_str, torch.bfloat16)
+
+    def _infer_engine(self, parallelism: str) -> str:
+        if parallelism in ["sequence", "deepspeed", "autotp"]:
+            return "deepspeed"
+        return "native"
+
+    def _get_backend(self, component_name: str = "component"):
+        parallelism = self.config.get("parallelism", "none")
+        engine = self.config.get("engine")
+        if engine is None:
+            engine = self._infer_engine(parallelism)
+            self.config["engine"] = engine
+
+        if self.backend is None or self.backend.name != engine:
+            strategy_cls = get_backend_strategy(engine)
+            self.backend = strategy_cls(self, self.config)
+
+        self.backend.validate_parallelism(parallelism, component_name)
+        return self.backend
+
+    def _get_engine_config_value(self, key: str, default=None):
+        engine_config = self.config.get("engine_config", {})
+        if key in engine_config:
+            return engine_config.get(key, default)
+        return self.config.get(key, default)
 
     def _get_autocast_context(self):
         """Get autocast context manager for mixed precision training.
@@ -713,7 +740,9 @@ class Trainer(RayActor):
         import torch.distributed as dist
 
         # Get DeepSpeed config parameters
-        zero_stage = config["zero_stage"]
+        zero_stage = self._get_engine_config_value("zero_stage", config.get("zero_stage"))
+        if zero_stage is None:
+            raise ValueError("DeepSpeed zero_stage must be provided via engine_config or config")
         learning_rate = config["learning_rate"]
         batch_size = config["batch_size"]
         autocast_enabled = config.get("autocast", True)
@@ -772,7 +801,9 @@ class Trainer(RayActor):
             train_batch_size = batch_size * data_parallel_size * gradient_accumulation_steps
 
         # Get reduce_bucket_size from config
-        reduce_bucket_size = config["reduce_bucket_size"]
+        reduce_bucket_size = self._get_engine_config_value("reduce_bucket_size", config.get("reduce_bucket_size"))
+        if reduce_bucket_size is None:
+            raise ValueError("DeepSpeed reduce_bucket_size must be provided via engine_config or config")
 
         # Configure DeepSpeed fp16/bf16/autocast based on dtype and autocast setting
         # When autocast is disabled, we use DeepSpeed's native fp16/bf16

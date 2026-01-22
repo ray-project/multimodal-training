@@ -110,6 +110,9 @@ class BaseVisionTrainer(Trainer):
         Args:
             load_pretrained_path: Optional path to pretrained checkpoint directory
         """
+        # Validate backend/parallelism pairing early
+        self._get_backend(component_name="vision")
+
         # Load model config
         logger.debug(f"[r{self.rank}] Loading vision model config...")
         model_config = self._load_model_config(model_name)
@@ -281,7 +284,7 @@ class BaseVisionTrainer(Trainer):
         external_optimizer = self.optimizer
 
         # Initialize with DeepSpeed using base class method and external optimizer
-        model_engine, optimizer, _, _ = self._initialize_deepspeed(
+        model_engine, optimizer, _, _ = self.backend.initialize_engine(
             model=model,
             params=params,
             config=config,

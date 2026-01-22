@@ -87,6 +87,9 @@ class BaseTextTrainer(Trainer):
         Returns:
             tuple: (model, lm_head, tp_group)
         """
+        # Validate backend/parallelism pairing early
+        self._get_backend(component_name="text")
+
         # Load model config
         logger.debug(f"[r{self.rank}] Loading text model config...")
         model_config = self._load_model_config(model_name)
@@ -258,7 +261,7 @@ class BaseTextTrainer(Trainer):
         external_optimizer = self.optimizer
 
         # Initialize with DeepSpeed using base class method and external optimizer
-        model_engine, optimizer, _, _ = self._initialize_deepspeed(
+        model_engine, optimizer, _, _ = self.backend.initialize_engine(
             model=model,
             params=params,
             config=config,
@@ -329,7 +332,9 @@ class BaseTextTrainer(Trainer):
         params = self._collect_parameters_from_modules(model, lm_head)
 
         # Determine AutoTP size (defaults to world size if not provided)
-        autotp_size = config.get("autotp_size") or config.get("tensor_parallel_size")
+        autotp_size = self._get_engine_config_value("autotp_size", config.get("autotp_size")) or config.get(
+            "tensor_parallel_size"
+        )
         if autotp_size is None:
             autotp_size = dist.get_world_size() if dist.is_initialized() else 1
         autotp_size = int(autotp_size)
@@ -379,7 +384,7 @@ class BaseTextTrainer(Trainer):
         # Apply vocabulary-parallel embedding for proper parallel loss computation
         # DeepSpeed AutoTP doesn't partition embeddings/lm_head by vocabulary dimension,
         # so we replace them with VocabParallelEmbedding for correct loss computation
-        if tp_group is not None and config.get("use_vocab_parallel", True):
+        if tp_group is not None and self._get_engine_config_value("use_vocab_parallel", True):
             tp_rank = groups.get_tensor_model_parallel_rank()
             tp_world_size = groups.get_tensor_model_parallel_world_size()
 
@@ -438,13 +443,13 @@ class BaseTextTrainer(Trainer):
         self._build_optimizer(params)
         external_optimizer = self.optimizer
 
-        tp_overlap_comm = config.get("tp_overlap_comm", None)
+        tp_overlap_comm = self._get_engine_config_value("tp_overlap_comm", None)
         tensor_parallel_cfg = {"autotp_size": autotp_size}
         if tp_overlap_comm is not None:
             tensor_parallel_cfg["tp_overlap_comm"] = bool(tp_overlap_comm)
 
         # Initialize DeepSpeed with AutoTP configuration and external optimizer
-        model_engine, optimizer, _, _ = self._initialize_deepspeed(
+        model_engine, optimizer, _, _ = self.backend.initialize_engine(
             model=model,
             params=params,
             config=config,
