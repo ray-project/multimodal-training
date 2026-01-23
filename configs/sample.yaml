@@ -4,25 +4,31 @@ debug: false
 vision:
   model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
   model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
-  parallelism: "sequence"  # Options: "none", "tensor", "sequence", "deepspeed"
+  engine: "deepspeed"  # Options: "deepspeed", "megatron", "swift"
+  parallelism: "sequence"  # Options: "none", "tensor", "sequence", "autotp"
   dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
   attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
   activation_checkpointing: true
   autocast: true  # Enable torch autocast for mixed precision
-  zero_stage: 1  # DeepSpeed ZeRO stage (1, 2, or 3)
+  engine_config:
+    zero_stage: 1  # DeepSpeed ZeRO stage (1, 2, or 3)
+    sequence_parallel_size: 8  # Parallel size for sequence parallelism
 
 # Text model configuration
 text:
   model_type: "qwen2_5_vl"  # Options: "qwen2_5_vl"
   model_name: "Qwen/Qwen2.5-VL-32B-Instruct"  # Path to pretrained model
-  parallelism: "tensor"  # Options: "none", "tensor", "deepspeed", "autotp"
+  engine: "megatron"  # Options: "deepspeed", "megatron", "swift"
+  parallelism: "tensor"  # Options: "none", "tensor", "autotp"
   dtype: "bfloat16"  # Options: "float16", "bfloat16", "float32"
   attention_backend: "flash_attention_2"  # Options: "sdpa", "flash_attention_2", "eager"
   activation_checkpointing: true
   autocast: true  # Enable torch autocast for mixed precision
-  zero_stage: 3  # DeepSpeed ZeRO stage (1, 2, or 3)
-  autotp_size: null  # Optional tensor parallel size when using AutoTP (defaults to world size)
-  tp_overlap_comm: false  # Enable TP communication overlap for AutoTP if supported
+  engine_config:
+    zero_stage: 3  # DeepSpeed ZeRO stage (1, 2, or 3)
+    tensor_parallel_size: 8  # Tensor parallel size when using tensor parallelism
+    autotp_size: null  # Optional tensor parallel size when using AutoTP (defaults to world size)
+    tp_overlap_comm: false  # Enable TP communication overlap for AutoTP if supported
 
 # Training configuration
 training:
