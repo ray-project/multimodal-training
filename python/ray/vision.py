@@ -33,8 +33,8 @@ except ImportError:
 class BaseVisionTrainer(Trainer):
     """Base class for vision trainers with common functionality."""
 
-    def __init__(self, config, rank: int):
-        super().__init__(config, rank)
+    def __init__(self, config, rank: int, **kwargs):
+        super().__init__(config, rank, **kwargs)
         self.receiver_gpu_ids = None
         self.use_ipc = False
         self.model = None

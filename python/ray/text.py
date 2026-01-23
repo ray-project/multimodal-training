@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 class BaseTextTrainer(Trainer):
     """Base class for text trainers with common functionality."""
 
-    def __init__(self, config, rank: int):
-        super().__init__(config, rank)
+    def __init__(self, config, rank: int, **kwargs):
+        super().__init__(config, rank, **kwargs)
         self.receiver_gpu_ids = None  # GPU IDs of vision trainers (for sending gradients back)
         self.use_ipc = False  # Whether to use CUDA IPC for this actor
         self._vision_grad_owner_rank = rank  # Which rank should receive gradients from this actor
@@ -954,16 +954,16 @@ class BaseTextTrainer(Trainer):
         # Shape: [batch_size, seq_len, hidden_size]
 
         # Replace <image> placeholder positions with vision embeddings
-        IMAGE_TOKEN_ID = 151655
+        image_token_id = getattr(self.model_config, "image_token_id", 151655)
 
         # Create mask for image token positions: [batch_size, seq_len, hidden_size]
-        image_mask = (input_ids == IMAGE_TOKEN_ID).unsqueeze(-1).expand_as(inputs_embeds)
+        image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
 
         # Guard 1: Verify <image> tokens exist in input_ids
-        num_image_tokens_in_input = (input_ids == IMAGE_TOKEN_ID).sum().item()
+        num_image_tokens_in_input = (input_ids == image_token_id).sum().item()
         if num_image_tokens_in_input == 0:
             raise RuntimeError(
-                f"[r{self.rank}] No <image> tokens (ID={IMAGE_TOKEN_ID}) found in input_ids! "
+                f"[r{self.rank}] No <image> tokens (ID={image_token_id}) found in input_ids! "
                 f"This likely means modality filter is wrong. input_ids shape: {input_ids.shape}"
             )
 
@@ -980,7 +980,7 @@ class BaseTextTrainer(Trainer):
             )
 
         # Guard 4: Verify labels have -100 at image token positions
-        image_positions = input_ids == IMAGE_TOKEN_ID
+        image_positions = input_ids == image_token_id
         labels_at_image_positions = labels[image_positions]
         if not torch.all(labels_at_image_positions == -100):
             num_wrong = (labels_at_image_positions != -100).sum().item()

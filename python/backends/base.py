@@ -19,6 +19,10 @@ class BackendStrategy(ABC):
             return self.engine_config.get(key, default)
         return self.config.get(key, default)
 
+    def ensure_available(self):
+        """Check backend dependencies and raise on missing requirements."""
+        return None
+
     @abstractmethod
     def validate_parallelism(self, parallelism: str, component_name: str = "component"):
         pass

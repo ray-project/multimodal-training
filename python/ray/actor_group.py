@@ -20,6 +20,7 @@ class ActorGroup:
         num_gpus: int = 1,
         collocate: bool = False,
         placement_group_handle=None,
+        actor_init_kwargs: dict | None = None,
     ):
         """Initialize ActorGroup.
 
@@ -31,9 +32,11 @@ class ActorGroup:
             num_gpus: GPUs per actor (fractional if collocating)
             collocate: Whether actors should be collocated with another group on same GPUs
             placement_group_handle: Existing placement group to use (for collocation)
+            actor_init_kwargs: Optional kwargs passed to actor constructor
         """
         self.num_actors = num_actors
         self.collocate = collocate
+        actor_init_kwargs = actor_init_kwargs or {}
 
         # Calculate GPU allocation per actor
         # When collocating, use fractional GPUs (e.g., 0.5 per actor)
@@ -75,13 +78,13 @@ class ActorGroup:
                         placement_group=self.placement_group,
                         placement_group_bundle_index=i,
                     ),
-                ).remote(config, i)
+                ).remote(config, i, **actor_init_kwargs)
             else:
                 # Standard scheduling
                 actor = remote_actor_cls.options(
                     num_cpus=num_cpus,
                     num_gpus=gpus_per_actor,
-                ).remote(config, i)
+                ).remote(config, i, **actor_init_kwargs)
             self._actors.append(actor)
 
         self._setup_process_group()

@@ -17,7 +17,7 @@ class Trainer(RayActor):
     use_deepspeed = False
     deepspeed_engine = None
 
-    def __init__(self, config, rank: int):
+    def __init__(self, config, rank: int, **kwargs):
         RayActor.__init__(self, rank)
         self.config = config
         self.backend = None
@@ -240,6 +240,7 @@ class Trainer(RayActor):
             strategy_cls = get_backend_strategy(engine)
             self.backend = strategy_cls(self, self.config)
 
+        self.backend.ensure_available()
         self.backend.validate_parallelism(parallelism, component_name)
         return self.backend
 

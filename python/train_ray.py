@@ -22,9 +22,8 @@ from .checkpoint import find_latest_checkpoint, load_epoch_checkpoint, save_epoc
 from .ray.actor_group import ActorGroup
 from .ray.logger import setup_logging
 from .ray.tensor_transfer import gather_gpu_ids
-from .ray.text import QwenTextTrainer
 from .ray.utils import initialize_ray
-from .ray.vision import QwenVisionTrainer
+from .trainer_registry import resolve_trainer
 
 # See: https://docs.ray.io/en/latest/ray-core/patterns/fork-new-processes.html
 mp.set_start_method("spawn", force=True)
@@ -122,22 +121,6 @@ def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict], dp_si
     return global_norm
 
 
-def get_vision_trainer_class(model_type: str):
-    """Get the appropriate vision trainer class based on model type."""
-    if model_type == "qwen2_5_vl":
-        return QwenVisionTrainer
-    else:
-        raise ValueError(f"Unsupported vision model_type: {model_type}")
-
-
-def get_text_trainer_class(model_type: str):
-    """Get the appropriate text trainer class based on model type."""
-    if model_type == "qwen2_5_vl":
-        return QwenTextTrainer
-    else:
-        raise ValueError(f"Unsupported text model_type: {model_type}")
-
-
 def normalize_component_config(component_config: dict, component_name: str) -> dict:
     """Normalize engine selection and engine_config for a component."""
     normalized = dict(component_config)
@@ -215,15 +198,29 @@ def main(cfg: DictConfig):
     logger.info(f"Creating {total_actors} total actors ({dp_size} DP replicas × {parallel_size} actors/replica)")
     logger.info(f"Collocation enabled: {collocate}")
 
-    # Select appropriate trainer classes based on model type
+    # Select appropriate trainer classes based on model type + engine
     vision_model_type = vision_config["model_type"]
     text_model_type = text_config["model_type"]
+    vision_engine = vision_config.get("engine")
+    text_engine = text_config.get("engine")
 
     logger.info(f"Vision model type: {vision_model_type}")
     logger.info(f"Text model type: {text_model_type}")
+    logger.info(f"Vision engine: {vision_engine}")
+    logger.info(f"Text engine: {text_engine}")
 
-    VisionTrainerClass = get_vision_trainer_class(vision_model_type)
-    TextTrainerClass = get_text_trainer_class(text_model_type)
+    VisionTrainerClass, vision_init_kwargs = resolve_trainer(
+        component_type="vision",
+        engine=vision_engine,
+        model_type=vision_model_type,
+        config=vision_config,
+    )
+    TextTrainerClass, text_init_kwargs = resolve_trainer(
+        component_type="text",
+        engine=text_engine,
+        model_type=text_model_type,
+        config=text_config,
+    )
 
     # Create actor groups with total_actors (dp_size * parallel_size)
     vision_trainer_group = ActorGroup(
@@ -231,6 +228,7 @@ def main(cfg: DictConfig):
         VisionTrainerClass,
         num_actors=total_actors,
         collocate=collocate,
+        actor_init_kwargs=vision_init_kwargs,
     )
 
     # For text trainer group, reuse the placement group if collocating
@@ -240,6 +238,7 @@ def main(cfg: DictConfig):
         num_actors=total_actors,
         collocate=collocate,
         placement_group_handle=vision_trainer_group.placement_group if collocate else None,
+        actor_init_kwargs=text_init_kwargs,
     )
 
     # Build models
