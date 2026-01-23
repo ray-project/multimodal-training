@@ -5,6 +5,10 @@
 
 set -e  # Exit on error
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$REPO_DIR"
+
 echo "=========================================="
 echo "Running Ray Hybrid Para Test Suite"
 echo "=========================================="
@@ -40,6 +44,50 @@ run_test() {
     echo ""
 }
 
+# Collect unique GPU test files via pytest collection
+collect_gpu_test_files() {
+    pytest -q --collect-only -m gpu tests 2>&1 | python -c '
+import sys
+
+paths = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line.startswith("="):
+        continue
+    path = line.split("::", 1)[0]
+    if path.endswith(".py"):
+        paths.append(path)
+
+seen = set()
+for path in paths:
+    if path not in seen:
+        seen.add(path)
+        print(path)
+'
+}
+
+# Heuristic: DP tests generally require 4+ GPUs
+required_gpus_for_file() {
+    local file_path="$1"
+    if [[ "$file_path" == *"_dp.py" ]]; then
+        echo 4
+    else
+        echo 2
+    fi
+}
+
+get_free_port() {
+    python - <<'PY'
+import socket
+
+sock = socket.socket()
+sock.bind(("", 0))
+port = sock.getsockname()[1]
+sock.close()
+print(port)
+PY
+}
+
 # CPU Tests
 echo ""
 echo "=========================================="
@@ -47,7 +95,7 @@ echo "PHASE 1: CPU-Only Tests"
 echo "=========================================="
 echo ""
 
-run_test "CPU Tests (all cpu_only markers)" "pytest -m cpu_only -v"
+run_test "CPU Tests (all non-gpu tests)" "pytest tests -m 'not gpu' -v"
 
 # GPU Tests - Run individually to avoid process group cleanup issues
 echo ""
@@ -70,32 +118,22 @@ else
         echo "Found $GPU_COUNT GPU(s). Running GPU tests..."
         echo ""
 
-        run_test "Sequence-parallel collectives smoke" \
-                 "torchrun --nproc_per_node=2 -m pytest tests/test_split_gather.py -m gpu -v"
-
-        run_test "Vision model parity (test_vision_compare.py)" \
-                 "torchrun --nproc_per_node=2 -m pytest tests/test_vision_compare.py -m gpu -v"
-
-        run_test "Vision model detailed diagnostics (test_vision_detailed.py)" \
-                 "torchrun --nproc_per_node=2 -m pytest tests/test_vision_detailed.py -m gpu -v"
-
-        run_test "Text model with DeepSpeed AutoTP" \
-                 "torchrun --nproc_per_node=2 -m pytest tests/test_text_autotp.py -v"
-
-        run_test "Vision model with DeepSpeed Sequence Parallel" \
-                 "torchrun --nproc_per_node=2 -m pytest tests/test_vision_sp.py -v"
-
-        # Run AutoTP + DP and Vision SP + DP tests only if 4+ GPUs available
-        if [ "$GPU_COUNT" -ge 4 ]; then
-            run_test "Text model with AutoTP + Data Parallel" \
-                     "torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_dp.py -v"
-
-            run_test "Vision model with Sequence Parallel + Data Parallel" \
-                     "torchrun --nproc_per_node=4 -m pytest tests/test_vision_sp_dp.py -v"
-        else
-            echo -e "${YELLOW}Skipping test_text_autotp_dp.py (requires 4+ GPUs, found $GPU_COUNT)${NC}"
-            echo -e "${YELLOW}Skipping test_vision_sp_dp.py (requires 4+ GPUs, found $GPU_COUNT)${NC}"
+        GPU_TEST_FILES=$(collect_gpu_test_files)
+        if [ -z "$GPU_TEST_FILES" ]; then
+            echo -e "${YELLOW}No tests collected with -m gpu. Skipping GPU tests.${NC}"
             echo ""
+        else
+            for test_file in $GPU_TEST_FILES; do
+                REQUIRED_GPUS=$(required_gpus_for_file "$test_file")
+                if [ "$GPU_COUNT" -lt "$REQUIRED_GPUS" ]; then
+                    echo -e "${YELLOW}Skipping $test_file (requires $REQUIRED_GPUS+ GPUs, found $GPU_COUNT)${NC}"
+                    echo ""
+                    continue
+                fi
+                MASTER_PORT=$(get_free_port)
+                run_test "GPU tests ($test_file)" \
+                         "torchrun --master-port=$MASTER_PORT --nproc_per_node=$REQUIRED_GPUS -m pytest $test_file -m gpu -v"
+            done
         fi
     fi
 fi

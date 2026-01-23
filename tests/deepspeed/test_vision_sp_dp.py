@@ -4,7 +4,7 @@ This test verifies that DeepSpeed's Sequence Parallel combined with Data Paralle
 correct training behavior with 4 GPUs: sp_size=2, dp_size=2.
 
 Run with:
-    torchrun --nproc_per_node=4 -m pytest tests/test_vision_sp_dp.py -v
+    torchrun --nproc_per_node=4 -m pytest tests/deepspeed/test_vision_sp_dp.py -v
 """
 
 import os
@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig  # noqa: E402
 from python.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel  # noqa: E402
@@ -43,7 +43,14 @@ def init_distributed():
 
 def create_small_model_config(model_name="Qwen/Qwen2.5-VL-3B-Instruct", num_layers=2):
     """Create a small model config for testing."""
-    config = Qwen2_5_VLConfig.from_pretrained(model_name, trust_remote_code=True)
+    try:
+        config = Qwen2_5_VLConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        pytest.skip(f"Cached model config not available for {model_name}: {exc}")
     # Reduce model size for faster testing
     config.vision_config.depth = num_layers
     return config

@@ -6,15 +6,13 @@ import pytest
 import ray
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.ray.actor_group import ActorGroup  # noqa: E402
 from python.ray.payloads import VisionOutputs  # noqa: E402
 from python.ray.test_support import TinyTextTrainer, TinyVisionTrainer  # noqa: E402
 
 pytestmark = [pytest.mark.gpu]
-
-
 
 
 def _build_component_config():
@@ -63,7 +61,7 @@ def test_deepspeed_engine_prepp():
         pytest.skip("CUDA is required for DeepSpeed pre-PP readiness test.")
     pytest.importorskip("deepspeed")
 
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     tests_root = Path(__file__).parent
     ray.init(
         address="auto",

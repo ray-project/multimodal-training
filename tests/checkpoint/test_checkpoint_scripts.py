@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.merge_checkpoint import load_and_merge_sharded_weights  # noqa: E402
 
 

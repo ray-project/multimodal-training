@@ -4,7 +4,7 @@ This test verifies that DeepSpeed's AutoTP combined with Data Parallel produces
 correct training behavior with 4 GPUs: tp_size=2, dp_size=2.
 
 Run with:
-    torchrun --nproc_per_node=4 -m pytest tests/test_text_autotp_dp.py -v
+    torchrun --nproc_per_node=4 -m pytest tests/deepspeed/test_text_autotp_dp.py -v
 """
 
 import os
@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig  # noqa: E402
 from python.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLTextModel  # noqa: E402
@@ -55,7 +55,14 @@ def init_distributed():
 
 def create_small_model_config(model_name="Qwen/Qwen2.5-VL-3B-Instruct", num_layers=2):
     """Create a small model config for testing."""
-    config = Qwen2_5_VLConfig.from_pretrained(model_name, trust_remote_code=True)
+    try:
+        config = Qwen2_5_VLConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        pytest.skip(f"Cached model config not available for {model_name}: {exc}")
     # Reduce model size for faster testing
     config.text_config.num_hidden_layers = num_layers
     return config

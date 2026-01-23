@@ -14,6 +14,8 @@ from python.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransform
 
 pytestmark = [pytest.mark.gpu, pytest.mark.integration]
 
+MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for vision comparison test", allow_module_level=True)
 
@@ -39,9 +41,20 @@ def init_distributed():
     return rank, world_size
 
 
+def _ensure_cached_config():
+    try:
+        Qwen2_5_VLConfig.from_pretrained(MODEL_ID, trust_remote_code=True, local_files_only=True)
+    except Exception as exc:
+        pytest.skip(f"Cached model config not available for {MODEL_ID}: {exc}")
+
+
 def create_model(sequence_parallel=False):
     """Create vision model."""
-    config = Qwen2_5_VLConfig.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct", trust_remote_code=True)
+    config = Qwen2_5_VLConfig.from_pretrained(
+        MODEL_ID,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
     vision_config = config.vision_config
     vision_config.sequence_parallel = sequence_parallel
     vision_config._attn_implementation = "flash_attention_2"
@@ -96,12 +109,18 @@ def load_pretrained_weights(model, rank):
     from transformers import Qwen2_5_VLForConditionalGeneration
 
     if rank == 0:
-        print("Loading pretrained weights from Qwen/Qwen2.5-VL-3B-Instruct...")
+        print(f"Loading pretrained weights from {MODEL_ID}...")
 
     # Load the full model to extract vision weights
-    full_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen2.5-VL-3B-Instruct", trust_remote_code=True, torch_dtype=torch.bfloat16
-    )
+    try:
+        full_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            MODEL_ID,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Cached pretrained weights not available for {MODEL_ID}: {exc}") from exc
 
     # Extract vision model state dict
     vision_state = full_model.visual.state_dict()
@@ -128,7 +147,12 @@ def _test_no_sp_baseline(rank):
         return None, None
 
     model = create_model(sequence_parallel=False)
-    model = load_pretrained_weights(model, rank)
+    try:
+        model = load_pretrained_weights(model, rank)
+    except RuntimeError as exc:
+        if dist.is_initialized():
+            dist.barrier()
+        pytest.skip(str(exc))
     model.eval()
 
     # Set seed for reproducibility
@@ -160,7 +184,10 @@ def _test_sp_equal_length(rank, pixel_values_ref, grid_thw_ref):
     print(f"[Rank {rank}] " + "=" * 60)
 
     model = create_model(sequence_parallel=True)
-    model = load_pretrained_weights(model, rank)
+    try:
+        model = load_pretrained_weights(model, rank)
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
     model.eval()
 
     # Use SAME input as baseline (broadcasted to all ranks)
@@ -195,6 +222,7 @@ def test_vision_comparison():
     rank, world_size = init_distributed()
 
     print(f"[Rank {rank}] Initialized with world_size={world_size}")
+    _ensure_cached_config()
 
     # Test 1: No SP (baseline) - only rank 0, but both ranks wait
     output_no_sp, pixel_values_ref = _test_no_sp_baseline(rank)

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.merge_checkpoint import _build_full_state_dict
 from scripts.split_checkpoint import _get_text_prefix, _normalize_hf_state_dict, _split_with_mapping
