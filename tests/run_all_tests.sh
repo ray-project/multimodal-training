@@ -23,17 +23,24 @@ NC='\033[0m' # No Color
 # Track failures
 FAILED_TESTS=()
 PASSED_TESTS=()
+TEST_START_TIME="$(date)"
+TEST_START_SECONDS="$(date +%s)"
+TEST_DURATIONS=()
 
 # Function to run a test and track results
 run_test() {
     local test_name="$1"
     local test_cmd="$2"
+    local start_ts
+    local end_ts
+    local duration
 
     echo "=========================================="
     echo "Running: $test_name"
     echo "Command: $test_cmd"
     echo "=========================================="
 
+    start_ts="$(date +%s)"
     if eval "$test_cmd"; then
         echo -e "${GREEN}✓ PASSED: $test_name${NC}"
         PASSED_TESTS+=("$test_name")
@@ -41,6 +48,9 @@ run_test() {
         echo -e "${RED}✗ FAILED: $test_name${NC}"
         FAILED_TESTS+=("$test_name")
     fi
+    end_ts="$(date +%s)"
+    duration=$((end_ts - start_ts))
+    TEST_DURATIONS+=("$test_name|$duration")
     echo ""
 }
 
@@ -148,19 +158,29 @@ echo ""
 SUMMARY_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 SUMMARY_DIR="$SCRIPT_DIR/summary"
 SUMMARY_FILE="$SUMMARY_DIR/run_all_tests_summary_${SUMMARY_TIMESTAMP}.txt"
+SUMMARY_MARKDOWN="$SUMMARY_DIR/SUMMARY.md"
+GIT_REVISION="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")"
+TEST_END_TIME="$(date)"
+TEST_END_SECONDS="$(date +%s)"
+TOTAL_DURATION=$((TEST_END_SECONDS - TEST_START_SECONDS))
 
 {
     echo "=========================================="
     echo "TEST SUMMARY"
     echo "=========================================="
     echo ""
-    echo "Date: $(date)"
+    echo "Start: $TEST_START_TIME"
+    echo "End: $TEST_END_TIME"
+    echo "Total duration: ${TOTAL_DURATION}s"
+    echo "Git revision: $GIT_REVISION"
     echo ""
 
-    if [ ${#PASSED_TESTS[@]} -gt 0 ]; then
-        echo "Passed (${#PASSED_TESTS[@]}):"
-        for test in "${PASSED_TESTS[@]}"; do
-            echo "  ✓ $test"
+    if [ ${#TEST_DURATIONS[@]} -gt 0 ]; then
+        echo "Durations:"
+        for entry in "${TEST_DURATIONS[@]}"; do
+            name="${entry%%|*}"
+            duration="${entry##*|}"
+            echo "  - $name: ${duration}s"
         done
         echo ""
     fi
@@ -171,11 +191,49 @@ SUMMARY_FILE="$SUMMARY_DIR/run_all_tests_summary_${SUMMARY_TIMESTAMP}.txt"
             echo "  ✗ $test"
         done
         echo ""
-    else
+    fi
+
+    if [ ${#PASSED_TESTS[@]} -gt 0 ]; then
+        echo "Passed (${#PASSED_TESTS[@]}):"
+        for test in "${PASSED_TESTS[@]}"; do
+            echo "  ✓ $test"
+        done
+        echo ""
+    fi
+
+    if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
         echo "All tests passed!"
         echo ""
     fi
 } > "$SUMMARY_FILE"
+
+{
+    echo "# Test Summary"
+    echo ""
+    echo "- Start: $TEST_START_TIME"
+    echo "- End: $TEST_END_TIME"
+    echo "- Total duration: ${TOTAL_DURATION}s"
+    echo "- Git revision: \`$GIT_REVISION\`"
+    echo "- Latest run log: \`$(basename "$SUMMARY_FILE")\`"
+    echo ""
+    echo "## Results"
+    echo ""
+    echo "| Test | Status | Duration |"
+    echo "| --- | --- | --- |"
+    for entry in "${TEST_DURATIONS[@]}"; do
+        name="${entry%%|*}"
+        duration="${entry##*|}"
+        status="✅ Passed"
+        for failed in "${FAILED_TESTS[@]}"; do
+            if [ "$failed" == "$name" ]; then
+                status="❌ Failed"
+                break
+            fi
+        done
+        echo "| $name | $status | ${duration}s |"
+    done
+    echo ""
+} > "$SUMMARY_MARKDOWN"
 
 if [ ${#PASSED_TESTS[@]} -gt 0 ]; then
     echo -e "${GREEN}Passed (${#PASSED_TESTS[@]}):${NC}"
@@ -192,9 +250,11 @@ if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
     done
     echo ""
     echo -e "${RED}Summary written to: $SUMMARY_FILE${NC}"
+    echo -e "${RED}Markdown summary: $SUMMARY_MARKDOWN${NC}"
     exit 1
 else
     echo -e "${GREEN}All tests passed!${NC}"
     echo -e "${GREEN}Summary written to: $SUMMARY_FILE${NC}"
+    echo -e "${GREEN}Markdown summary: $SUMMARY_MARKDOWN${NC}"
     exit 0
 fi

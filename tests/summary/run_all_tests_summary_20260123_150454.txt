@@ -1,0 +1,41 @@
+==========================================
+TEST SUMMARY
+==========================================
+
+Start: Fri Jan 23 14:58:53 PST 2026
+End: Fri Jan 23 15:04:54 PST 2026
+Total duration: 361s
+Git revision: 52ee0189f4c352afb1fddf8dee3b1c44d8f73c6c
+
+Durations:
+  - CPU Tests (all non-gpu tests): 37s
+  - GPU tests (tests/deepspeed/test_engine_deepspeed_prepp.py): 44s
+  - GPU tests (tests/deepspeed/test_text_autotp.py): 26s
+  - GPU tests (tests/deepspeed/test_text_autotp_dp.py): 30s
+  - GPU tests (tests/deepspeed/test_vision_sp.py): 20s
+  - GPU tests (tests/deepspeed/test_vision_sp_dp.py): 28s
+  - GPU tests (tests/dtensor/test_text_dtensor.py): 19s
+  - GPU tests (tests/integration/test_phase4_functional.py): 14s
+  - GPU tests (tests/megatron/test_engine_megatron_prepp.py): 14s
+  - GPU tests (tests/parallel/test_rdt_non_collocated.py): 28s
+  - GPU tests (tests/parallel/test_split_gather.py): 20s
+  - GPU tests (tests/parallel/test_vision_compare.py): 29s
+  - GPU tests (tests/parallel/test_vision_detailed.py): 39s
+
+Passed (13):
+  ✓ CPU Tests (all non-gpu tests)
+  ✓ GPU tests (tests/deepspeed/test_engine_deepspeed_prepp.py)
+  ✓ GPU tests (tests/deepspeed/test_text_autotp.py)
+  ✓ GPU tests (tests/deepspeed/test_text_autotp_dp.py)
+  ✓ GPU tests (tests/deepspeed/test_vision_sp.py)
+  ✓ GPU tests (tests/deepspeed/test_vision_sp_dp.py)
+  ✓ GPU tests (tests/dtensor/test_text_dtensor.py)
+  ✓ GPU tests (tests/integration/test_phase4_functional.py)
+  ✓ GPU tests (tests/megatron/test_engine_megatron_prepp.py)
+  ✓ GPU tests (tests/parallel/test_rdt_non_collocated.py)
+  ✓ GPU tests (tests/parallel/test_split_gather.py)
+  ✓ GPU tests (tests/parallel/test_vision_compare.py)
+  ✓ GPU tests (tests/parallel/test_vision_detailed.py)
+
+All tests passed!
+

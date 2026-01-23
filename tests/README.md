@@ -91,15 +91,4 @@ Verifies hybrid parallelism combining DeepSpeed Sequence Parallel with Data Para
 
 ## Summary
 
-| Test File | Marker | Status | Command |
-|-----------|--------|--------|---------|
-| `test_sequence_parallel_ragged.py` | cpu_only | ✅ Passing | `pytest tests/test_sequence_parallel_ragged.py -m cpu_only` |
-| `test_ragged_sp_smoke.py` | cpu_only | ✅ Passing | `pytest tests/test_ragged_sp_smoke.py -m cpu_only` |
-| `test_dataset_modalities.py` | cpu_only | ✅ Passing | `pytest tests/test_dataset_modalities.py -m cpu_only` |
-| `test_split_gather.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_split_gather.py -m gpu -v` |
-| `test_vision_compare.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_compare.py -m gpu -v` |
-| `test_vision_detailed.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/test_vision_detailed.py -m gpu -v` |
-| `deepspeed/test_text_autotp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/deepspeed/test_text_autotp.py -v` |
-| `deepspeed/test_text_autotp_dp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=4 -m pytest tests/deepspeed/test_text_autotp_dp.py -v` |
-| `deepspeed/test_vision_sp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=2 -m pytest tests/deepspeed/test_vision_sp.py -v` |
-| `deepspeed/test_vision_sp_dp.py` | gpu | ✅ Passing | `torchrun --nproc_per_node=4 -m pytest tests/deepspeed/test_vision_sp_dp.py -v` |
+The latest test summary is generated at `tests/summary/SUMMARY.md`.
