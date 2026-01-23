@@ -145,6 +145,38 @@ echo "TEST SUMMARY"
 echo "=========================================="
 echo ""
 
+SUMMARY_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+SUMMARY_DIR="$SCRIPT_DIR/summary"
+SUMMARY_FILE="$SUMMARY_DIR/run_all_tests_summary_${SUMMARY_TIMESTAMP}.txt"
+
+{
+    echo "=========================================="
+    echo "TEST SUMMARY"
+    echo "=========================================="
+    echo ""
+    echo "Date: $(date)"
+    echo ""
+
+    if [ ${#PASSED_TESTS[@]} -gt 0 ]; then
+        echo "Passed (${#PASSED_TESTS[@]}):"
+        for test in "${PASSED_TESTS[@]}"; do
+            echo "  ✓ $test"
+        done
+        echo ""
+    fi
+
+    if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
+        echo "Failed (${#FAILED_TESTS[@]}):"
+        for test in "${FAILED_TESTS[@]}"; do
+            echo "  ✗ $test"
+        done
+        echo ""
+    else
+        echo "All tests passed!"
+        echo ""
+    fi
+} > "$SUMMARY_FILE"
+
 if [ ${#PASSED_TESTS[@]} -gt 0 ]; then
     echo -e "${GREEN}Passed (${#PASSED_TESTS[@]}):${NC}"
     for test in "${PASSED_TESTS[@]}"; do
@@ -159,8 +191,10 @@ if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
         echo -e "  ${RED}✗${NC} $test"
     done
     echo ""
+    echo -e "${RED}Summary written to: $SUMMARY_FILE${NC}"
     exit 1
 else
     echo -e "${GREEN}All tests passed!${NC}"
+    echo -e "${GREEN}Summary written to: $SUMMARY_FILE${NC}"
     exit 0
 fi

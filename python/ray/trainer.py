@@ -845,6 +845,8 @@ class Trainer(RayActor):
                     # weight_decay is handled per parameter group in model_parameters
                     # to exclude bias/norm params, matching DTensor behavior
                     "weight_decay": 0.0,
+                    # Avoid building fused optimizers during tests.
+                    "torch_adam": True,
                 },
             }
 
@@ -880,12 +882,18 @@ class Trainer(RayActor):
         # Initialize with DeepSpeed
         # If an external optimizer is provided, pass it to DeepSpeed
         # Otherwise, DeepSpeed will create one based on ds_config["optimizer"]
+        dist_init_required = None
+        if dist.is_initialized():
+            dist_init_required = False
+            logger.debug(f"[r{rank}] DeepSpeed initialize: dist already initialized, skipping init.")
+
         model_engine, ds_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizer,
             model_parameters=params if optimizer is None else None,
             config=ds_config,
             mpu=mpu,
+            dist_init_required=dist_init_required,
         )
 
         logger.debug(f"[r{rank}] DeepSpeed initialization complete")

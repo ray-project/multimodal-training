@@ -32,7 +32,12 @@ if not torch.cuda.is_available():
 def init_distributed():
     """Initialize distributed environment."""
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        try:
+            dist.init_process_group(backend="nccl", device_id=local_rank)
+        except TypeError:
+            dist.init_process_group(backend="nccl")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -40,6 +45,11 @@ def init_distributed():
     torch.cuda.set_device(local_rank)
 
     return rank, world_size, local_rank
+
+
+def _maybe_destroy_process_group() -> None:
+    """Avoid destroying process group mid-module to prevent re-init hangs."""
+    return
 
 
 def create_small_model_config(model_name="Qwen/Qwen2.5-VL-3B-Instruct", num_layers=2):
@@ -633,7 +643,7 @@ def test_dtensor_vs_no_parallel():
 
     # Cleanup
     dist.barrier()
-    dist.destroy_process_group()
+    _maybe_destroy_process_group()
 
     print(f"[Rank {rank}] Test complete")
 
@@ -756,7 +766,7 @@ def test_vocab_parallel_cross_entropy_dtensor():
         assert test_passed, f"vocab_parallel_causal_cross_entropy produced incorrect loss: diff={loss_diff:.8e}"
 
     dist.barrier()
-    dist.destroy_process_group()
+    _maybe_destroy_process_group()
 
     print(f"[Rank {rank}] Test complete")
 

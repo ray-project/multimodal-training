@@ -8,6 +8,7 @@ Run with:
 
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -42,7 +43,31 @@ class AutoTPQwenTextTrainer(QwenTextMixin, BaseTextTrainer):
 def init_distributed():
     """Initialize distributed environment."""
     if not dist.is_initialized():
-        init_distributed_comm(backend="nccl", use_deepspeed=True)
+        try:
+            from deepspeed.utils import groups as ds_groups
+
+            ds_groups._TENSOR_MODEL_PARALLEL_GROUP = None
+            ds_groups._DATA_PARALLEL_GROUP = None
+            ds_groups._MODEL_PARALLEL_GROUP = None
+            ds_groups._WORLD_GROUP = None
+            ds_groups.mesh_device = None
+            ds_groups._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
+            ds_groups._MPU_TENSOR_MODEL_PARALLEL_RANK = None
+        except Exception:
+            pass
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        try:
+            dist.init_process_group(backend="nccl", device_id=local_rank)
+        except TypeError:
+            dist.init_process_group(backend="nccl")
+
+        try:
+            import deepspeed
+
+            deepspeed.init_distributed(dist_backend="nccl", dist_init_required=False)
+        except Exception:
+            pass
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -50,6 +75,21 @@ def init_distributed():
     torch.cuda.set_device(local_rank)
 
     return rank, world_size, local_rank
+
+
+def _barrier(label: str, timeout_s: int = 180) -> None:
+    """Barrier with timeout to avoid silent hangs."""
+    if not dist.is_initialized():
+        return
+    try:
+        dist.barrier(timeout=timedelta(seconds=timeout_s))
+    except TypeError:
+        dist.barrier()
+
+
+def _maybe_destroy_process_group() -> None:
+    """Avoid destroying process group mid-module to prevent re-init hangs."""
+    return
 
 
 def create_small_model_config(model_name="Qwen/Qwen2.5-VL-3B-Instruct", num_layers=2):
@@ -178,6 +218,7 @@ def create_autotp_trainer(model_config, rank, autotp_size, device, torch_dtype, 
     trainer.model.tp_group = tp_group
     trainer.deepspeed_engine = model_engine
 
+    print(f"[create_autotp_trainer] done (rank={rank})", flush=True)
     return trainer
 
 
@@ -459,10 +500,18 @@ def run_autotp_training(
     # Collect parameters
     params = trainer._collect_parameters_from_modules(model, lm_head)
 
+    try:
+        from deepspeed.utils import groups
+
+        groups._init_tp_mesh_device(autotp_size)
+    except Exception as exc:
+        pass
+
     from deepspeed.utils import groups
     tensor_parallel_cfg = {"autotp_size": autotp_size}
 
     # Initialize DeepSpeed with AutoTP
+    os.environ.pop("DEEPSPEED_DEBUG_AUTOTP", None)
     model_engine, optimizer, _, _ = trainer._initialize_deepspeed(
         model=model,
         params=params,
@@ -652,7 +701,7 @@ def test_autotp_vs_no_parallel():
         )
 
     # Sync before starting AutoTP test
-    dist.barrier()
+    _barrier("after baseline")
 
     # ========================================
     # AutoTP model (all ranks)
@@ -676,7 +725,7 @@ def test_autotp_vs_no_parallel():
     # ========================================
     # Compare losses and parameters (rank 0 only)
     # ========================================
-    dist.barrier()
+    _barrier("after autotp training")
 
     if rank == 0:
         print(f"\n[Rank {rank}] " + "=" * 60)
@@ -765,8 +814,8 @@ def test_autotp_vs_no_parallel():
         print(f"\n[Rank {rank}] Comparison complete")
 
     # Cleanup
-    dist.barrier()
-    dist.destroy_process_group()
+    _barrier("before cleanup")
+    _maybe_destroy_process_group()
 
     print(f"[Rank {rank}] Test complete")
 
@@ -819,7 +868,7 @@ def test_autotp_vocab_parallel():
     else:
         baseline_logits = []
 
-    dist.barrier()
+    _barrier("after baseline vocab")
 
     # ========================================
     # AutoTP model with vocab parallel (all ranks)
@@ -843,7 +892,7 @@ def test_autotp_vocab_parallel():
     # ========================================
     # Compare losses (rank 0 only)
     # ========================================
-    dist.barrier()
+    _barrier("after autotp vocab")
 
     if rank == 0:
         print(f"\n[Rank {rank}] " + "=" * 60)
@@ -908,8 +957,8 @@ def test_autotp_vocab_parallel():
             print(f"[Rank {rank}] TEST RESULT: ✅ PASSED - AutoTP with VocabParallelEmbedding working correctly!")
         print(f"[Rank {rank}] ====================================================================")
 
-    dist.barrier()
-    dist.destroy_process_group()
+    _barrier("before cleanup vocab")
+    _maybe_destroy_process_group()
 
     print(f"[Rank {rank}] Test complete")
 
@@ -1012,7 +1061,7 @@ def test_vocab_parallel_cross_entropy_correctness():
     # ========================================
     # Compare results (rank 0)
     # ========================================
-    dist.barrier()
+    _barrier("before compare vocab CE")
 
     if rank == 0:
         loss_diff = abs(baseline_loss.item() - parallel_loss.item())
@@ -1040,8 +1089,8 @@ def test_vocab_parallel_cross_entropy_correctness():
         # Assert for pytest
         assert test_passed, f"vocab_parallel_causal_cross_entropy produced incorrect loss: diff={loss_diff:.8e}"
 
-    dist.barrier()
-    dist.destroy_process_group()
+    _barrier("before cleanup vocab CE")
+    _maybe_destroy_process_group()
 
     print(f"[Rank {rank}] Test complete")
 

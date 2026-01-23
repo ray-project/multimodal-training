@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from transformers import Qwen2_5_VLConfig
+from transformers.utils import is_flash_attn_2_available
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -48,6 +49,12 @@ def _ensure_cached_config():
         pytest.skip(f"Cached model config not available for {MODEL_ID}: {exc}")
 
 
+def _select_attention_impl() -> str:
+    if is_flash_attn_2_available():
+        return "flash_attention_2"
+    return "sdpa"
+
+
 def create_model(sequence_parallel=False):
     """Create vision model."""
     config = Qwen2_5_VLConfig.from_pretrained(
@@ -57,7 +64,7 @@ def create_model(sequence_parallel=False):
     )
     vision_config = config.vision_config
     vision_config.sequence_parallel = sequence_parallel
-    vision_config._attn_implementation = "flash_attention_2"
+    vision_config._attn_implementation = _select_attention_impl()
 
     model = Qwen2_5_VisionTransformerPretrainedModel(vision_config)
     model = model.to(dtype=torch.bfloat16, device="cuda")

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
+from transformers.utils import is_flash_attn_2_available
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -16,6 +17,12 @@ pytestmark = [pytest.mark.gpu, pytest.mark.integration]
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for detailed vision diagnostics", allow_module_level=True)
+
+
+def _select_attention_impl() -> str:
+    if is_flash_attn_2_available():
+        return "flash_attention_2"
+    return "sdpa"
 
 
 def init_dist():
@@ -73,7 +80,7 @@ def test_intermediate_outputs():
     # Create config
     config = Qwen2_5_VLVisionConfig()
     config.sequence_parallel = True  # Enable SP for both ranks
-    config._attn_implementation = "flash_attention_2"
+    config._attn_implementation = _select_attention_impl()
 
     # Create model
     model = Qwen2_5_VisionTransformerPretrainedModel(config)

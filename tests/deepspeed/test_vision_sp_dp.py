@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from transformers.utils import is_flash_attn_2_available
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -26,6 +27,12 @@ pytestmark = [pytest.mark.gpu, pytest.mark.integration]
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for Sequence Parallel+DP test", allow_module_level=True)
+
+
+def _select_attention_impl() -> str:
+    if is_flash_attn_2_available():
+        return "flash_attention_2"
+    return "sdpa"
 
 
 def init_distributed():
@@ -91,7 +98,7 @@ def create_sp_dp_model(model_config, rank, sp_size, device, torch_dtype, seed=42
     # Enable sequence parallelism
     vision_config = model_config.vision_config
     vision_config.sequence_parallel = True
-    vision_config._attn_implementation = "flash_attention_2"
+    vision_config._attn_implementation = _select_attention_impl()
 
     # Initialize DeepSpeed sequence parallel groups
     try:
