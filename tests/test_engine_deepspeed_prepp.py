@@ -9,6 +9,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from python.ray.actor_group import ActorGroup  # noqa: E402
+from python.ray.payloads import VisionOutputs  # noqa: E402
 from python.ray.test_support import TinyTextTrainer, TinyVisionTrainer  # noqa: E402
 
 pytestmark = [pytest.mark.gpu]
@@ -17,8 +18,11 @@ pytestmark = [pytest.mark.gpu]
 
 
 def _build_component_config():
+    import os
+
+    model_name = os.environ.get("DEEPSPEED_TEST_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
     return {
-        "model_name": "tiny",
+        "model_name": model_name,
         "model_type": "tiny",
         "engine": "deepspeed",
         "engine_config": {"zero_stage": 1, "reduce_bucket_size": 1000},
@@ -88,15 +92,14 @@ def test_deepspeed_engine_prepp():
         assert all(text_pg), "Text process group was not initialized"
 
         vision_results = vision_group.execute_all("forward_step_no_return", 0)
-        dummy_vision = {
-            "vision_embeddings": torch.zeros(
+        dummy_vision = VisionOutputs(
+            embeddings=torch.zeros(
                 1,
                 vision_config["vision_tokens"],
                 vision_config["hidden_size"],
             ),
-            "sample_index": 0,
-            "iteration": 0,
-        }
+            meta={"sample_index": 0, "iteration": 0},
+        )
         text_refs = text_group.execute_all_async("forward_step", [dummy_vision], [0])
         text_results = ray.get(text_refs)
         assert isinstance(text_results[0], dict)

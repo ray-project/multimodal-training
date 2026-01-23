@@ -8,15 +8,23 @@ import torch.nn as nn
 
 from ..tensor_parallel import VocabParallelEmbedding
 from ..tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
-from .tensor_transfer import (
-    TensorTransferRequest,
-    prepare_tensor_for_transfer,
-    receive_tensor,
-)
+from .payloads import normalize_vision_outputs, TextBackwardOutputs
+from .tensor_transfer import TensorTransferRequest, prepare_tensor_for_transfer, receive_tensor
 from .trainer import Trainer
 from .utils import get_physical_gpu_id, init_distributed_comm
 
 logger = logging.getLogger(__name__)
+
+
+class _VisionEmbedAdapter:
+    """Adapter to present precomputed vision embeddings as a visual module."""
+
+    def __init__(self, vision_embeds: torch.Tensor):
+        self._vision_embeds = vision_embeds
+        self.dtype = vision_embeds.dtype
+
+    def __call__(self, pixel_values, grid_thw=None):
+        return self._vision_embeds
 
 
 class BaseTextTrainer(Trainer):
@@ -795,16 +803,10 @@ class BaseTextTrainer(Trainer):
         else:
             vision_data = vision_embeddings_ref
 
-        # Vision trainer returns dict with embeddings and metadata
-        if not isinstance(vision_data, dict):
-            raise RuntimeError(
-                f"[r{self.rank}] Expected vision_data to be dict with 'vision_embeddings', 'sample_index', 'iteration', "
-                f"but got type {type(vision_data)}"
-            )
-
-        vision_embeddings_data = vision_data.get("vision_embeddings")
-        vision_sample_index = vision_data.get("sample_index")
-        vision_iteration = vision_data.get("iteration")
+        vision_payload = normalize_vision_outputs(vision_data)
+        vision_embeddings_data = vision_payload.embeddings
+        vision_sample_index = vision_payload.meta.get("sample_index")
+        vision_iteration = vision_payload.meta.get("iteration")
 
         # Guard: Verify iteration matches
         if vision_iteration != iteration:
@@ -833,7 +835,7 @@ class BaseTextTrainer(Trainer):
         self._vision_grad_owner_rank = self.rank
 
         # Get vision forward timing if available
-        vision_forward_time_ms = vision_data.get("forward_time_ms", 0.0)
+        vision_forward_time_ms = vision_payload.meta.get("forward_time_ms", 0.0)
 
         loss = self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
 
@@ -846,6 +848,53 @@ class BaseTextTrainer(Trainer):
             result["vision_forward_time_ms"] = vision_forward_time_ms
 
         return result
+
+    def _apply_vision_embeddings(self, inputs_embeds, input_ids, vision_embeddings, batch):
+        image_token_id = getattr(self.model_config, "image_token_id", 151655)
+        num_image_tokens_in_input = (input_ids == image_token_id).sum().item()
+        if num_image_tokens_in_input == 0:
+            raise RuntimeError(
+                f"[r{self.rank}] No <image> tokens (ID={image_token_id}) found in input_ids! "
+                f"This likely means modality filter is wrong. input_ids shape: {input_ids.shape}"
+            )
+
+        vision_embeds_flat = vision_embeddings.reshape(-1, vision_embeddings.shape[-1])
+        num_vision_embeds = vision_embeds_flat.shape[0]
+        if num_vision_embeds != num_image_tokens_in_input:
+            raise RuntimeError(
+                f"[r{self.rank}] Mismatch: {num_vision_embeds} vision embeddings but "
+                f"{num_image_tokens_in_input} <image> tokens in input_ids! "
+                f"Vision and text trainers are out of sync."
+            )
+
+        if getattr(self, "processor", None) is None:
+            from transformers import AutoProcessor
+
+            self.processor = AutoProcessor.from_pretrained(
+                self.config["model_name"],
+                min_pixels=self.config["min_pixels"],
+                max_pixels=self.config["max_pixels"],
+            )
+
+        template_inputs = {
+            "input_ids": input_ids,
+            "pixel_values": batch.get("pixel_values"),
+            "pixel_values_videos": batch.get("pixel_values_videos"),
+            "image_grid_thw": batch.get("image_grid_thw"),
+            "video_grid_thw": batch.get("video_grid_thw"),
+        }
+
+        try:
+            from swift.llm.template.base import Template
+
+            adapter = _VisionEmbedAdapter(vision_embeds_flat)
+            return Template._get_inputs_embeds_hf(
+                inputs_embeds, template_inputs, adapter, self.processor, self.model_config
+            )
+        except Exception as exc:
+            logger.warning(f"[r{self.rank}] Swift template path failed, falling back to manual scatter: {exc}")
+            image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            return inputs_embeds.masked_scatter(image_mask, vision_embeds_flat)
 
     def _forward_step_impl(self, vision_embeddings, vision_sample_index=None, iteration=-1):
         """
@@ -950,36 +999,14 @@ class BaseTextTrainer(Trainer):
         actual_model = self._get_actual_model()
 
         # Get text embeddings from input_ids (which contains <image> placeholder tokens)
-        inputs_embeds = actual_model.embed_tokens(input_ids)
+        embed_module = self._get_embedding_module(actual_model)
+        if embed_module is None:
+            raise RuntimeError(f"[r{self.rank}] Unable to locate embedding module for text model.")
+        inputs_embeds = embed_module(input_ids)
         # Shape: [batch_size, seq_len, hidden_size]
 
-        # Replace <image> placeholder positions with vision embeddings
-        image_token_id = getattr(self.model_config, "image_token_id", 151655)
-
-        # Create mask for image token positions: [batch_size, seq_len, hidden_size]
-        image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-
-        # Guard 1: Verify <image> tokens exist in input_ids
-        num_image_tokens_in_input = (input_ids == image_token_id).sum().item()
-        if num_image_tokens_in_input == 0:
-            raise RuntimeError(
-                f"[r{self.rank}] No <image> tokens (ID={image_token_id}) found in input_ids! "
-                f"This likely means modality filter is wrong. input_ids shape: {input_ids.shape}"
-            )
-
-        # Flatten vision embeddings to [total_vision_tokens, hidden_size] for scattering
-        vision_embeds_flat = vision_embeddings.reshape(-1, vision_embeddings.shape[-1])
-
-        # Guard 2: Verify vision embeddings count matches image token count
-        num_vision_embeds = vision_embeds_flat.shape[0]
-        if num_vision_embeds != num_image_tokens_in_input:
-            raise RuntimeError(
-                f"[r{self.rank}] Mismatch: {num_vision_embeds} vision embeddings but "
-                f"{num_image_tokens_in_input} <image> tokens in input_ids! "
-                f"Vision and text trainers are out of sync."
-            )
-
         # Guard 4: Verify labels have -100 at image token positions
+        image_token_id = getattr(self.model_config, "image_token_id", 151655)
         image_positions = input_ids == image_token_id
         labels_at_image_positions = labels[image_positions]
         if not torch.all(labels_at_image_positions == -100):
@@ -989,10 +1016,7 @@ class BaseTextTrainer(Trainer):
                 f"positions with other values. This indicates incorrect label preprocessing."
             )
 
-        logger.debug(f"[r{self.rank}] Replacing {num_image_tokens_in_input} <image> tokens with vision embeddings")
-
-        # Use masked_scatter to replace image placeholder positions with vision embeddings
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, vision_embeds_flat)
+        inputs_embeds = self._apply_vision_embeddings(inputs_embeds, input_ids, vision_embeddings, batch)
 
         logger.debug(
             f"[r{self.rank}] {self.__class__.__name__}: inputs_embeds shape={inputs_embeds.shape}, "
@@ -1102,10 +1126,8 @@ class BaseTextTrainer(Trainer):
 
         # Build result dict, conditionally including timing
         def _build_result(grad_data):
-            result = {"grad": grad_data}
-            if profile_time:
-                result["backward_time_ms"] = backward_time_ms
-            return result
+            meta = {"backward_time_ms": backward_time_ms} if profile_time else {}
+            return TextBackwardOutputs(grad=grad_data, meta=meta)
 
         if grad_to_send is None:
             return _build_result(None)

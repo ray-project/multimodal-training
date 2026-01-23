@@ -1,12 +1,17 @@
 """Pre-PP readiness test for Megatron engine initialization."""
 
-import socket
 import sys
 from pathlib import Path
 
 import pytest
 import ray
 import torch
+
+from python.ray.actor_group import ActorGroup  # noqa: E402
+from python.ray.megatron_trainer import (  # noqa: E402
+    MegatronTextTrainer,
+    MegatronVisionTrainer,
+)
 
 pytestmark = [pytest.mark.gpu]
 
@@ -19,53 +24,28 @@ sys.path.insert(0, str(MEGATRON_ROOT))
 sys.path.insert(0, str(MS_SWIFT_ROOT))
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-@ray.remote(num_cpus=2, num_gpus=1)
-class MegatronPreppActor:
-    def initialize_megatron(self, master_port: int) -> dict:
-        import os
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required for Megatron pre-PP readiness test.")
-
-        if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
-            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{major}.{minor}")
-        import torch.distributed as dist
-
-        try:
-            import megatron  # noqa: F401
-        except Exception as exc:
-            raise RuntimeError("Megatron-LM import failed; ensure Megatron-LM is available.") from exc
-
-        if not dist.is_initialized():
-            torch.cuda.set_device(0)
-            dist.init_process_group(
-                backend="nccl",
-                init_method=f"tcp://127.0.0.1:{master_port}",
-                rank=0,
-                world_size=1,
-            )
-
-        from megatron.core import mpu
-
-        if not mpu.model_parallel_is_initialized():
-            mpu.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-
-        model = torch.nn.Linear(4, 4)
-        inputs = torch.zeros(2, 4)
-        loss = model(inputs).sum()
-        loss.backward()
-
-        return {
-            "dist_initialized": dist.is_initialized(),
-            "model_parallel_initialized": mpu.model_parallel_is_initialized(),
-        }
+def _build_component_config(model_path: str):
+    return {
+        "model_name": model_path,
+        "model_type": "qwen2_5_vl",
+        "engine": "megatron",
+        "engine_config": {
+            "tensor_parallel_size": 1,
+            "sequence_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "attention_backend": "unfused",
+            "load_weights": True,
+        },
+        "parallelism": "tensor",
+        "dtype": "bfloat16",
+        "attention_backend": "sdpa",
+        "activation_checkpointing": False,
+        "autocast": False,
+        "seed": 123,
+        "dp_size": 1,
+        "parallel_size": 1,
+        "text_seq_len": 4,
+    }
 
 
 def test_megatron_engine_prepp():
@@ -81,7 +61,10 @@ def test_megatron_engine_prepp():
     except Exception:
         pytest.skip("Megatron-LM is not available; skipping Megatron pre-PP readiness test.")
 
-    master_port = _find_free_port()
+    model_path = os.environ.get("MEGATRON_TEST_MODEL")
+    if not model_path:
+        pytest.skip("Set MEGATRON_TEST_MODEL to a HF model path for Megatron pre-PP readiness test.")
+
     ray.init(
         address="auto",
         ignore_reinit_error=True,
@@ -98,14 +81,33 @@ def test_megatron_engine_prepp():
                         str(MS_SWIFT_ROOT),
                     ]
                 ),
+                "USE_HF": "1",
+                "HF_HOME": os.environ.get("HF_HOME", "/mnt/local_storage/hf-cache"),
                 **({"TORCH_CUDA_ARCH_LIST": arch_list} if arch_list else {}),
             },
         },
     )
     try:
-        actor = MegatronPreppActor.remote()
-        results = ray.get(actor.initialize_megatron.remote(master_port))
-        assert results["dist_initialized"]
-        assert results["model_parallel_initialized"]
+        vision_config = _build_component_config(model_path)
+        text_config = _build_component_config(model_path)
+
+        vision_group = ActorGroup(vision_config, MegatronVisionTrainer, num_actors=1, num_cpus=2, num_gpus=1)
+        text_group = ActorGroup(text_config, MegatronTextTrainer, num_actors=1, num_cpus=2, num_gpus=1)
+
+        vision_group.execute_all("build_model")
+        text_group.execute_all("build_model")
+        vision_group.execute_all("initialize_trainer")
+        text_group.execute_all("initialize_trainer")
+
+        vision_pg = vision_group.execute_all("is_process_group_initialized")
+        text_pg = text_group.execute_all("is_process_group_initialized")
+        assert all(vision_pg), "Vision process group was not initialized"
+        assert all(text_pg), "Text process group was not initialized"
+
+        vision_outputs = vision_group.execute_all("forward_step", 0)
+        text_group.execute_all("forward_step", vision_outputs, 0)
+
+        text_backward = text_group.execute_all("backward_step")
+        vision_group.execute_all("backward_step", text_backward)
     finally:
         ray.shutdown()

@@ -6,6 +6,7 @@ import ray
 import torch
 import torch.nn as nn
 
+from .payloads import VisionOutputs
 from .text import BaseTextTrainer
 from .vision import BaseVisionTrainer
 
@@ -84,7 +85,10 @@ class TinyVisionTrainer(BaseVisionTrainer):
 
     def forward_step_no_return(self, iteration: int = -1):
         result = super().forward_step(iteration)
-        result.pop("vision_embeddings", None)
+        if isinstance(result, VisionOutputs):
+            return VisionOutputs(embeddings=None, attention_mask=None, meta=result.meta)
+        if isinstance(result, dict):
+            result.pop("vision_embeddings", None)
         return result
 
     def is_process_group_initialized(self):

@@ -54,14 +54,22 @@ def resolve_trainer(component_type: str, engine: str | None, model_type: str, co
 
 
 def _resolve_default_trainer(component_type: str, engine: str, model_type: str) -> TrainerRegistration | None:
-    if model_type != "qwen2_5_vl" or engine not in {"native", "deepspeed"}:
+    if model_type != "qwen2_5_vl" or engine not in {"native", "deepspeed", "megatron"}:
         return None
 
     if component_type == "vision":
+        if engine == "megatron":
+            from .ray.megatron_trainer import MegatronVisionTrainer
+
+            return TrainerRegistration(trainer_cls=MegatronVisionTrainer)
         from .ray.vision import QwenVisionTrainer
 
         return TrainerRegistration(trainer_cls=QwenVisionTrainer)
     if component_type == "text":
+        if engine == "megatron":
+            from .ray.megatron_trainer import MegatronTextTrainer
+
+            return TrainerRegistration(trainer_cls=MegatronTextTrainer)
         from .ray.text import QwenTextTrainer
 
         return TrainerRegistration(trainer_cls=QwenTextTrainer)
@@ -94,8 +102,10 @@ def _list_supported_combinations(
     defaults = {
         ("vision", "native", "qwen2_5_vl"),
         ("vision", "deepspeed", "qwen2_5_vl"),
+        ("vision", "megatron", "qwen2_5_vl"),
         ("text", "native", "qwen2_5_vl"),
         ("text", "deepspeed", "qwen2_5_vl"),
+        ("text", "megatron", "qwen2_5_vl"),
     }
     combinations = set(_REGISTRY.keys()) | defaults
 

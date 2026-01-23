@@ -55,6 +55,8 @@ class Trainer(RayActor):
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
+        # Store processor for downstream template usage (text trainers)
+        self.processor = processor
 
         # Build DataConfig
         datasets = self.config["datasets"]

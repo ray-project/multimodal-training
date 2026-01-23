@@ -13,11 +13,8 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
-from .tensor_transfer import (
-    TensorTransferRequest,
-    prepare_tensor_for_transfer,
-    receive_tensor,
-)
+from .payloads import normalize_text_backward_outputs, TextBackwardOutputs, VisionOutputs
+from .tensor_transfer import TensorTransferRequest, prepare_tensor_for_transfer, receive_tensor
 from .trainer import Trainer
 from .utils import get_physical_gpu_id, init_distributed_comm
 
@@ -479,15 +476,7 @@ class BaseVisionTrainer(Trainer):
         # Enqueue outputs for backward pass (supports multiple outstanding microbatches)
         self._pending_outputs.append(vision_outputs)
 
-        # Return both vision embeddings and metadata for synchronization verification
-        result = {
-            "vision_embeddings": vision_outputs,
-            "sample_index": sample_index,
-            "iteration": iteration,
-            "forward_time_ms": forward_time_ms,
-        }
-
-        # Use CUDA IPC if configured
+        payload_embeddings = vision_outputs
         if self.use_ipc and self.receiver_gpu_ids is not None:
             sender_gpu_id = get_physical_gpu_id()
             transfer_request = prepare_tensor_for_transfer(
@@ -496,11 +485,16 @@ class BaseVisionTrainer(Trainer):
                 sender_gpu_id=sender_gpu_id,
                 use_ipc_if_same_gpu=True,
             )
-            # Wrap transfer request with metadata
-            result["vision_embeddings"] = transfer_request.to_dict()
-            return result
-        else:
-            return result
+            payload_embeddings = transfer_request.to_dict()
+
+        payload_meta = {
+            "sample_index": sample_index,
+            "iteration": iteration,
+        }
+        if profile_time:
+            payload_meta["forward_time_ms"] = forward_time_ms
+
+        return VisionOutputs(embeddings=payload_embeddings, meta=payload_meta)
 
     def _retrieve_gradient_tensor(self, vision_grad_ref):
         """Retrieve gradient tensor from Ray reference or transfer request."""
@@ -512,9 +506,9 @@ class BaseVisionTrainer(Trainer):
         else:
             vision_grad_data = vision_grad_ref
 
-        # Handle new dict format from text backward_step: {"grad": ..., "backward_time_ms": ...}
-        if isinstance(vision_grad_data, dict) and "grad" in vision_grad_data:
-            vision_grad_data = vision_grad_data["grad"]
+        if isinstance(vision_grad_data, (TextBackwardOutputs, dict)):
+            normalized = normalize_text_backward_outputs(vision_grad_data)
+            vision_grad_data = normalized.grad
 
         if vision_grad_data is None:
             return None
