@@ -28,6 +28,12 @@ def prepare_runtime_environment() -> dict[str, str]:
     if os.environ.get("WANDB_API_KEY"):
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
+    if os.environ.get("PYTHONPATH"):
+        env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
+
+    if os.environ.get("MODELSCOPE_CACHE"):
+        env_vars["MODELSCOPE_CACHE"] = os.environ["MODELSCOPE_CACHE"]
+
     # Set log file path for Ray actors to use
     if "RAY_TRAIN_LOG_FILE" not in os.environ:
         log_file = os.path.abspath("logs/train.log")

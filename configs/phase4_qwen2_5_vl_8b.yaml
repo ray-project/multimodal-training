@@ -1,0 +1,66 @@
+debug: false
+
+vision:
+  model_type: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  engine: "deepspeed"
+  parallelism: "sequence"
+  dtype: "bfloat16"
+  attention_backend: "sdpa"
+  activation_checkpointing: false
+  autocast: true
+  pretrained_checkpoint_dir: "/mnt/local_storage/checkpoints/qwen2_5_vl_8b_split"
+  engine_config:
+    zero_stage: 1
+    sequence_parallel_size: 2
+
+text:
+  model_type: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  engine: "megatron"
+  parallelism: "tensor"
+  dtype: "bfloat16"
+  attention_backend: "sdpa"
+  activation_checkpointing: false
+  autocast: true
+  engine_config:
+    tensor_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    attention_backend: "unfused"
+
+training:
+  batch_size: 1
+  learning_rate: 5e-05
+  num_epochs: 1
+  num_iterations: 2
+  warmup_steps: 0
+  warmup_ratio: 0.0
+  lr_scheduler_type: "constant"
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  seed: 42
+  parallel_size: 2
+  dp_size: 1
+  collocate: true
+  clip_grad_norm: false
+  max_grad_norm: 1.0
+  no_checkpoint: true
+  checkpoint_dir: "/mnt/local_storage/checkpoints/phase4_qwen2_5_vl_8b"
+  log_interval: 1
+
+data:
+  datasets:
+    - mscoco2017_train_captions
+  data_registry:
+    mscoco2017_train_captions:
+      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_train_qwen.json"
+      data_path: "/mnt/local_storage/mscoco2017"
+  num_workers: 2
+  pin_memory: true
+  data_flatten: true
+  min_pixels: 802816
+  max_pixels: 802816
+  force_fixed_size: false
+
+deepspeed:
+  reduce_bucket_size: 100000000

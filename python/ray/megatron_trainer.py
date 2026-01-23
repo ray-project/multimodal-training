@@ -29,6 +29,8 @@ class MegatronBaseTrainer(Trainer):
         self.megatron_args = None
         self.megatron_bridge = None
         self._megatron_initialized = False
+        self.receiver_gpu_ids = None
+        self.use_ipc = False
 
     def _initialize_megatron(self):
         if self._megatron_initialized:
@@ -110,6 +112,14 @@ class MegatronBaseTrainer(Trainer):
         import torch.distributed as dist
 
         return dist.is_initialized()
+
+    def set_receiver_info(self, receiver_gpu_ids: list[str], use_ipc: bool):
+        """Set receiver GPU IDs and whether to use CUDA IPC."""
+        self.receiver_gpu_ids = receiver_gpu_ids
+        self.use_ipc = use_ipc
+        logger.debug(
+            f"[r{self.rank}] {self.__class__.__name__}: receiver_gpu_ids={receiver_gpu_ids}, use_ipc={use_ipc}"
+        )
 
 
 @ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
