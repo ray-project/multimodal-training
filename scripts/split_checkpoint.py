@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to split a HuggingFace Qwen2.5-VL checkpoint into separate vision and text model weights.
+Script to split a HuggingFace Qwen-VL checkpoint into separate vision and text model weights.
 
 This is necessary because the training framework disaggregates the model into vision and text
 components that can use different parallelism strategies.
@@ -122,7 +122,7 @@ def split_checkpoint(
     model_type: Optional[str] = None,
 ):
     """
-    Load a Qwen2.5-VL checkpoint from HuggingFace and split it into vision and text components.
+    Load a Qwen-VL checkpoint from HuggingFace and split it into vision and text components.
 
     Args:
         model_name: HuggingFace model name or path (e.g., "Qwen/Qwen2.5-VL-7B-Instruct")
