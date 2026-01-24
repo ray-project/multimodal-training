@@ -54,6 +54,14 @@ class MegatronBaseTrainer(Trainer):
 
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         megatron_kwargs = convert_hf_config(hf_config)
+        megatron_overrides = {
+            key.replace("megatron_", "", 1): value
+            for key, value in engine_config.items()
+            if key.startswith("megatron_") and value is not None
+        }
+        if megatron_overrides:
+            logger.info(f"[r{self.rank}] Overriding Megatron args from engine_config: {megatron_overrides}")
+            megatron_kwargs.update(megatron_overrides)
 
         tp_size = int(engine_config.get("tensor_parallel_size", 1))
         sp_size = int(engine_config.get("sequence_parallel_size", 1))
@@ -125,6 +133,11 @@ class MegatronBaseTrainer(Trainer):
         logger.debug(
             f"[r{self.rank}] {self.__class__.__name__}: receiver_gpu_ids={receiver_gpu_ids}, use_ipc={use_ipc}"
         )
+
+    def get_megatron_num_layers(self) -> int:
+        """Expose Megatron num_layers for tests."""
+        self._initialize_megatron()
+        return int(getattr(self.megatron_args, "num_layers", 0))
 
 
 @ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)

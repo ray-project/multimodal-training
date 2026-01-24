@@ -24,7 +24,7 @@ sys.path.insert(0, str(MEGATRON_ROOT))
 sys.path.insert(0, str(MS_SWIFT_ROOT))
 
 
-def _build_component_config(model_path: str):
+def _build_component_config(model_path: str, engine_overrides: dict | None = None):
     import os
 
     expert_model_parallel_size = int(os.environ.get("MEGATRON_TEST_EP_SIZE", "1"))
@@ -55,6 +55,8 @@ def _build_component_config(model_path: str):
     }
     if num_experts_env is not None:
         config["engine_config"]["num_experts"] = int(num_experts_env)
+    if engine_overrides:
+        config["engine_config"].update(engine_overrides)
     return config
 
 
@@ -119,5 +121,54 @@ def test_megatron_engine_prepp():
 
         text_backward = text_group.execute_all("backward_step")
         vision_group.execute_all("backward_step", text_backward)
+    finally:
+        ray.shutdown()
+
+
+def test_megatron_num_layers_override():
+    import os
+
+    try:
+        import megatron  # noqa: F401
+    except Exception:
+        pytest.skip("Megatron-LM is not available; skipping Megatron num_layers override test.")
+
+    model_path = os.environ.get("MEGATRON_TEST_MODEL")
+    if not model_path:
+        pytest.skip("Set MEGATRON_TEST_MODEL to a HF model path for Megatron num_layers override test.")
+
+    ray.init(
+        address="auto",
+        ignore_reinit_error=True,
+        include_dashboard=False,
+        runtime_env={
+            "working_dir": str(PROJECT_ROOT / "multimodal-training"),
+            "py_modules": [str(MEGATRON_ROOT), str(MS_SWIFT_ROOT)],
+            "excludes": [".git/**", "**/.git/**", "**/__pycache__/**"],
+            "env_vars": {
+                "PYTHONPATH": ":".join(
+                    [
+                        str(PROJECT_ROOT / "multimodal-training"),
+                        str(MEGATRON_ROOT),
+                        str(MS_SWIFT_ROOT),
+                    ]
+                ),
+                "USE_HF": "1",
+                "HF_HOME": os.environ.get("HF_HOME", "/mnt/local_storage/hf-cache"),
+            },
+        },
+    )
+    try:
+        text_config = _build_component_config(
+            model_path,
+            engine_overrides={
+                "load_weights": False,
+                "megatron_num_layers": 2,
+            },
+        )
+        text_group = ActorGroup(text_config, MegatronTextTrainer, num_actors=1, num_cpus=2, num_gpus=1)
+        text_group.execute_all("build_model")
+        num_layers = text_group.execute_all("get_megatron_num_layers")
+        assert num_layers == [2], f"Expected num_layers override to be 2, got {num_layers}"
     finally:
         ray.shutdown()
