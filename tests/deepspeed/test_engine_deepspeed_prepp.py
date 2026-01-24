@@ -62,14 +62,19 @@ def test_deepspeed_engine_prepp():
     pytest.importorskip("deepspeed")
 
     project_root = Path(__file__).resolve().parents[2]
+    repo_root = project_root.parent
+    deepspeed_root = repo_root / "DeepSpeed"
     tests_root = Path(__file__).parent
+    py_modules = [str(tests_root)]
+    if deepspeed_root.exists():
+        py_modules.append(str(deepspeed_root))
     ray.init(
         address="auto",
         ignore_reinit_error=True,
         include_dashboard=False,
         runtime_env={
             "working_dir": str(project_root),
-            "py_modules": [str(tests_root)],
+            "py_modules": py_modules,
         },
     )
     try:

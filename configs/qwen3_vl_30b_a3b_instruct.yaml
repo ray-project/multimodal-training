@@ -1,39 +1,40 @@
 debug: false
 
 vision:
-  model_type: "qwen2_5_vl"
-  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
-  engine: "deepspeed"
-  parallelism: "sequence"
-  dtype: "bfloat16"
-  attention_backend: "flash_attention_2"
-  activation_checkpointing: false
-  autocast: true
-  # pretrained_checkpoint_dir: "/mnt/local_storage/checkpoints/qwen2_5_vl_8b_split"  # optional
-  engine_config:
-    zero_stage: 1
-    sequence_parallel_size: 4
-
-text:
-  model_type: "qwen2_5_vl"
-  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  model_type: "qwen3_vl"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
   attention_backend: "flash_attention_2"
-  activation_checkpointing: false
+  activation_checkpointing: true
   autocast: true
-  # pretrained_checkpoint_dir: "/mnt/local_storage/checkpoints/qwen2_5_vl_8b_split"  # optional
   engine_config:
     tensor_parallel_size: 4
     pipeline_model_parallel_size: 1
+    sequence_parallel_size: 1
+    attention_backend: "unfused"
+
+text:
+  model_type: "qwen3_vl"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  engine: "megatron"
+  parallelism: "tensor"
+  dtype: "bfloat16"
+  attention_backend: "flash_attention_2"
+  activation_checkpointing: true
+  autocast: true
+  engine_config:
+    tensor_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    sequence_parallel_size: 1
     attention_backend: "unfused"
 
 training:
   batch_size: 1
   learning_rate: 5e-05
   num_epochs: 1
-  num_iterations: 2
+  num_iterations: 20
   warmup_steps: 0
   warmup_ratio: 0.0
   lr_scheduler_type: "constant"
@@ -46,7 +47,7 @@ training:
   clip_grad_norm: false
   max_grad_norm: 1.0
   no_checkpoint: true
-  checkpoint_dir: "/mnt/local_storage/checkpoints/phase4_qwen2_5_vl_8b"
+  checkpoint_dir: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b"
   log_interval: 1
 
 data:

@@ -1,33 +1,40 @@
 debug: false
 
 vision:
-  model_type: "qwen2_5_vl"
-  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
-  engine: "deepspeed"
-  parallelism: "sequence"
-  dtype: "bfloat16"
-  attention_backend: "flash_attention_2"
-  activation_checkpointing: false
-  autocast: true
-  # pretrained_checkpoint_dir: "/mnt/local_storage/checkpoints/qwen2_5_vl_8b_split"  # optional
-  engine_config:
-    zero_stage: 1
-    sequence_parallel_size: 4
-
-text:
-  model_type: "qwen2_5_vl"
-  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  model_type: "qwen3_vl"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "flash_attention_2"
+  attention_backend: "unfused"
   activation_checkpointing: false
   autocast: true
-  # pretrained_checkpoint_dir: "/mnt/local_storage/checkpoints/qwen2_5_vl_8b_split"  # optional
   engine_config:
-    tensor_parallel_size: 4
+    tensor_parallel_size: 8
     pipeline_model_parallel_size: 1
+    sequence_parallel_size: 8
+    expert_model_parallel_size: 1
     attention_backend: "unfused"
+    load_weights: false
+    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
+
+text:
+  model_type: "qwen3_vl"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  engine: "megatron"
+  parallelism: "tensor"
+  dtype: "bfloat16"
+  attention_backend: "unfused"
+  activation_checkpointing: false
+  autocast: true
+  engine_config:
+    tensor_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    sequence_parallel_size: 8
+    expert_model_parallel_size: 1
+    attention_backend: "unfused"
+    load_weights: false
+    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
 training:
   batch_size: 1
@@ -40,13 +47,13 @@ training:
   weight_decay: 0.0
   gradient_accumulation_steps: 1
   seed: 42
-  parallel_size: 4
+  parallel_size: 8
   dp_size: 1
-  collocate: true
+  collocate: false
   clip_grad_norm: false
   max_grad_norm: 1.0
-  no_checkpoint: true
-  checkpoint_dir: "/mnt/local_storage/checkpoints/phase4_qwen2_5_vl_8b"
+  no_checkpoint: false
+  checkpoint_dir: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_moe_tp_smoke"
   log_interval: 1
 
 data:

@@ -210,6 +210,39 @@ class MegatronVisionTrainer(MegatronBaseTrainer):
             return self.megatron_model.visual.visual
         return self.megatron_model.visual
 
+    def _extract_vision_embeddings(self, outputs):
+        """Normalize vision outputs to a single tensor for text input."""
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+        if isinstance(outputs, (list, tuple)):
+            for item in outputs:
+                if isinstance(item, torch.Tensor):
+                    return item
+            raise RuntimeError("Vision outputs list/tuple did not contain a tensor.")
+        if isinstance(outputs, dict):
+            for key in ("last_hidden_state", "hidden_states", "vision_embeddings", "embeddings"):
+                value = outputs.get(key)
+                if isinstance(value, torch.Tensor):
+                    return value
+            for value in outputs.values():
+                if isinstance(value, torch.Tensor):
+                    return value
+            raise RuntimeError("Vision outputs dict did not contain a tensor.")
+
+        for attr in ("last_hidden_state", "vision_embeddings", "embeddings"):
+            value = getattr(outputs, attr, None)
+            if isinstance(value, torch.Tensor):
+                return value
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if isinstance(hidden_states, torch.Tensor):
+            return hidden_states
+        if isinstance(hidden_states, (list, tuple)) and hidden_states:
+            last_hidden = hidden_states[-1]
+            if isinstance(last_hidden, torch.Tensor):
+                return last_hidden
+
+        raise RuntimeError(f"Unsupported vision outputs type: {type(outputs)}")
+
     def forward_step(self, iteration: int = -1):
         batch = self._dummy_batch
         pixel_values = batch["pixel_values"]
@@ -219,9 +252,10 @@ class MegatronVisionTrainer(MegatronBaseTrainer):
         visual_module = self._get_visual_module()
         with autocast_context:
             outputs = visual_module(hidden_states=pixel_values, grid_thw=image_grid_thw)
+        embeddings = self._extract_vision_embeddings(outputs)
 
-        self._pending_outputs.append(outputs)
-        return VisionOutputs(embeddings=outputs, meta={"iteration": iteration})
+        self._pending_outputs.append(embeddings)
+        return VisionOutputs(embeddings=embeddings, meta={"iteration": iteration})
 
     def _retrieve_gradient_tensor(self, vision_grad_ref):
         if vision_grad_ref is None:
@@ -367,6 +401,20 @@ class MegatronTextTrainer(MegatronBaseTrainer):
         )
         if position_ids.dim() == 2:
             position_ids = position_ids.unsqueeze(0).repeat(3, 1, 1)
+            context_parallel_size = int(getattr(self.megatron_args, "context_parallel_size", 1))
+            if context_parallel_size > 1:
+                from megatron.core import parallel_state
+
+                cp_rank = parallel_state.get_context_parallel_rank()
+                seq_len = position_ids.shape[-1]
+                if seq_len % context_parallel_size != 0:
+                    raise RuntimeError(
+                        f"Sequence length {seq_len} not divisible by context_parallel_size {context_parallel_size}."
+                    )
+                segment = seq_len // context_parallel_size
+                start = cp_rank * segment
+                end = start + segment
+                position_ids = position_ids[..., start:end]
         loss = self.megatron_model(
             input_ids=input_ids,
             position_ids=position_ids,
