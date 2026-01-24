@@ -27,7 +27,7 @@ text:
   engine_config:
     tensor_parallel_size: 4
     pipeline_model_parallel_size: 1
-    attention_backend: "unfused"
+    attention_backend: "unfused"  # OK without sequence_parallel_size; use "auto" if SP > 1
 
 training:
   batch_size: 1

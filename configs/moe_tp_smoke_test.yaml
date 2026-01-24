@@ -6,7 +6,7 @@ vision:
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "unfused"
+  attention_backend: "auto"  # Use auto to allow FusedAttention with context parallelism
   activation_checkpointing: false
   autocast: true
   engine_config:
@@ -14,7 +14,7 @@ vision:
     pipeline_model_parallel_size: 1
     sequence_parallel_size: 8
     expert_model_parallel_size: 1
-    attention_backend: "unfused"
+    attention_backend: "auto"  # unfused doesn't support context parallelism (SP > 1)
     load_weights: false
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
@@ -24,7 +24,7 @@ text:
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "unfused"
+  attention_backend: "auto"  # Use auto to allow FusedAttention with context parallelism
   activation_checkpointing: false
   autocast: true
   engine_config:
@@ -32,7 +32,7 @@ text:
     pipeline_model_parallel_size: 1
     sequence_parallel_size: 8
     expert_model_parallel_size: 1
-    attention_backend: "unfused"
+    attention_backend: "auto"  # unfused doesn't support context parallelism (SP > 1)
     load_weights: false
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
