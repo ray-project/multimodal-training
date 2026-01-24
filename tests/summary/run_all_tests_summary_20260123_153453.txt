@@ -1,15 +1,13 @@
-# Test Summary
+==========================================
+TEST SUMMARY
+==========================================
 
-- Start: Fri Jan 23 15:28:39 PST 2026
-- End: Fri Jan 23 15:34:53 PST 2026
-- Total duration: 374s
-- Git revision: `0a07ca4fdbf48d90309cb49671bd22c29de0435e`
-- Latest run log: `run_all_tests_summary_20260123_153453.txt`
-- Environment log: `run_all_tests_env_20260123_153453.txt`
+Start: Fri Jan 23 15:28:39 PST 2026
+End: Fri Jan 23 15:34:53 PST 2026
+Total duration: 374s
+Git revision: 0a07ca4fdbf48d90309cb49671bd22c29de0435e
+Environment details: /home/ray/default/mm/multimodal-training/tests/summary/run_all_tests_env_20260123_153453.txt
 
-## Environment
-
-```
 ==========================================
 ENVIRONMENT DETAILS
 ==========================================
@@ -462,23 +460,36 @@ yarl==1.18.3
 ypy-websocket==0.8.4
 zipp==3.19.2
 zstandard==0.23.0
-```
 
-## Results
+Durations:
+  - CPU Tests (all non-gpu tests): 37s
+  - GPU tests (tests/deepspeed/test_engine_deepspeed_prepp.py): 45s
+  - GPU tests (tests/deepspeed/test_text_autotp.py): 29s
+  - GPU tests (tests/deepspeed/test_text_autotp_dp.py): 30s
+  - GPU tests (tests/deepspeed/test_vision_sp.py): 20s
+  - GPU tests (tests/deepspeed/test_vision_sp_dp.py): 33s
+  - GPU tests (tests/dtensor/test_text_dtensor.py): 19s
+  - GPU tests (tests/integration/test_phase4_functional.py): 14s
+  - GPU tests (tests/megatron/test_engine_megatron_prepp.py): 15s
+  - GPU tests (tests/parallel/test_rdt_non_collocated.py): 30s
+  - GPU tests (tests/parallel/test_split_gather.py): 21s
+  - GPU tests (tests/parallel/test_vision_compare.py): 30s
+  - GPU tests (tests/parallel/test_vision_detailed.py): 38s
 
-| Test | Status | Duration |
-| --- | --- | --- |
-| CPU Tests (all non-gpu tests) | ✅ Passed | 37s |
-| GPU tests (tests/deepspeed/test_engine_deepspeed_prepp.py) | ✅ Passed | 45s |
-| GPU tests (tests/deepspeed/test_text_autotp.py) | ✅ Passed | 29s |
-| GPU tests (tests/deepspeed/test_text_autotp_dp.py) | ✅ Passed | 30s |
-| GPU tests (tests/deepspeed/test_vision_sp.py) | ✅ Passed | 20s |
-| GPU tests (tests/deepspeed/test_vision_sp_dp.py) | ✅ Passed | 33s |
-| GPU tests (tests/dtensor/test_text_dtensor.py) | ✅ Passed | 19s |
-| GPU tests (tests/integration/test_phase4_functional.py) | ✅ Passed | 14s |
-| GPU tests (tests/megatron/test_engine_megatron_prepp.py) | ✅ Passed | 15s |
-| GPU tests (tests/parallel/test_rdt_non_collocated.py) | ✅ Passed | 30s |
-| GPU tests (tests/parallel/test_split_gather.py) | ✅ Passed | 21s |
-| GPU tests (tests/parallel/test_vision_compare.py) | ✅ Passed | 30s |
-| GPU tests (tests/parallel/test_vision_detailed.py) | ✅ Passed | 38s |
+Passed (13):
+  ✓ CPU Tests (all non-gpu tests)
+  ✓ GPU tests (tests/deepspeed/test_engine_deepspeed_prepp.py)
+  ✓ GPU tests (tests/deepspeed/test_text_autotp.py)
+  ✓ GPU tests (tests/deepspeed/test_text_autotp_dp.py)
+  ✓ GPU tests (tests/deepspeed/test_vision_sp.py)
+  ✓ GPU tests (tests/deepspeed/test_vision_sp_dp.py)
+  ✓ GPU tests (tests/dtensor/test_text_dtensor.py)
+  ✓ GPU tests (tests/integration/test_phase4_functional.py)
+  ✓ GPU tests (tests/megatron/test_engine_megatron_prepp.py)
+  ✓ GPU tests (tests/parallel/test_rdt_non_collocated.py)
+  ✓ GPU tests (tests/parallel/test_split_gather.py)
+  ✓ GPU tests (tests/parallel/test_vision_compare.py)
+  ✓ GPU tests (tests/parallel/test_vision_detailed.py)
+
+All tests passed!
 

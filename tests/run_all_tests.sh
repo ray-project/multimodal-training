@@ -26,6 +26,91 @@ PASSED_TESTS=()
 TEST_START_TIME="$(date)"
 TEST_START_SECONDS="$(date +%s)"
 TEST_DURATIONS=()
+PYTHON_BIN="$(command -v python || true)"
+
+get_python_version() {
+    if [ -n "$PYTHON_BIN" ]; then
+        python - <<'PY'
+import sys
+print(sys.version.replace("\n", " "))
+PY
+    else
+        echo "python-not-found"
+    fi
+}
+
+get_ray_version() {
+    if [ -n "$PYTHON_BIN" ]; then
+        python - <<'PY'
+try:
+    import ray
+    print(ray.__version__)
+except Exception as exc:
+    print(f"unavailable: {exc}")
+PY
+    else
+        echo "python-not-found"
+    fi
+}
+
+collect_env_info() {
+    local env_file="$1"
+    local python_version
+    local ray_version
+
+    python_version="$(get_python_version)"
+    ray_version="$(get_ray_version)"
+
+    {
+        echo "=========================================="
+        echo "ENVIRONMENT DETAILS"
+        echo "=========================================="
+        echo ""
+        echo "Python executable: ${PYTHON_BIN:-python-not-found}"
+        echo "Python version: $python_version"
+        echo "Ray version: $ray_version"
+        echo ""
+        echo "CUDA versions:"
+        if command -v nvidia-smi &> /dev/null; then
+            nvidia-smi 2>/dev/null | grep -m 1 "CUDA Version" || echo "  nvidia-smi output unavailable"
+        else
+            echo "  nvidia-smi not found"
+        fi
+        if command -v nvcc &> /dev/null; then
+            nvcc --version 2>/dev/null || echo "  nvcc output unavailable"
+        else
+            echo "  nvcc not found"
+        fi
+        echo ""
+
+        if command -v conda &> /dev/null; then
+            echo "Conda environments:"
+            conda info --envs 2>/dev/null || conda env list 2>/dev/null || echo "  unavailable"
+            if [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
+                echo ""
+                echo "Active conda env: $CONDA_DEFAULT_ENV"
+            fi
+            if [ -n "${CONDA_PREFIX:-}" ]; then
+                echo "Conda prefix: $CONDA_PREFIX"
+            fi
+        elif [ -n "${CONDA_DEFAULT_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; then
+            echo "Conda environment (from environment variables):"
+            echo "Active conda env: ${CONDA_DEFAULT_ENV:-unknown}"
+            echo "Conda prefix: ${CONDA_PREFIX:-unknown}"
+        else
+            echo "Conda: not in use"
+        fi
+
+        echo ""
+        echo "Python package versions (pip freeze):"
+        if [ -n "$PYTHON_BIN" ]; then
+            python -m pip freeze 2>&1 || echo "pip freeze failed"
+        else
+            echo "python-not-found"
+        fi
+        echo ""
+    } > "$env_file"
+}
 
 # Function to run a test and track results
 run_test() {
@@ -158,11 +243,15 @@ echo ""
 SUMMARY_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 SUMMARY_DIR="$SCRIPT_DIR/summary"
 SUMMARY_FILE="$SUMMARY_DIR/run_all_tests_summary_${SUMMARY_TIMESTAMP}.txt"
+ENV_INFO_FILE="$SUMMARY_DIR/run_all_tests_env_${SUMMARY_TIMESTAMP}.txt"
 SUMMARY_MARKDOWN="$SUMMARY_DIR/SUMMARY.md"
 GIT_REVISION="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")"
 TEST_END_TIME="$(date)"
 TEST_END_SECONDS="$(date +%s)"
 TOTAL_DURATION=$((TEST_END_SECONDS - TEST_START_SECONDS))
+
+mkdir -p "$SUMMARY_DIR"
+collect_env_info "$ENV_INFO_FILE"
 
 {
     echo "=========================================="
@@ -173,7 +262,9 @@ TOTAL_DURATION=$((TEST_END_SECONDS - TEST_START_SECONDS))
     echo "End: $TEST_END_TIME"
     echo "Total duration: ${TOTAL_DURATION}s"
     echo "Git revision: $GIT_REVISION"
+    echo "Environment details: $ENV_INFO_FILE"
     echo ""
+    cat "$ENV_INFO_FILE"
 
     if [ ${#TEST_DURATIONS[@]} -gt 0 ]; then
         echo "Durations:"
@@ -215,6 +306,7 @@ TOTAL_DURATION=$((TEST_END_SECONDS - TEST_START_SECONDS))
     echo "- Total duration: ${TOTAL_DURATION}s"
     echo "- Git revision: \`$GIT_REVISION\`"
     echo "- Latest run log: \`$(basename "$SUMMARY_FILE")\`"
+    echo "- Environment log: \`$(basename "$ENV_INFO_FILE")\`"
     echo ""
     echo "## Results"
     echo ""
