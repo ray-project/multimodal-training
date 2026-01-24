@@ -1,9 +1,58 @@
 import logging
 import os
+import time
 
 import ray
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_log_path(archive_dir: str, timestamp: str, suffix: str = "") -> str:
+    base_name = f"train_{timestamp}{suffix}.log"
+    candidate = os.path.join(archive_dir, base_name)
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(archive_dir, f"train_{timestamp}{suffix}_{counter}.log")
+        counter += 1
+    return candidate
+
+
+def _archive_existing_log(symlink_path: str, archive_dir: str) -> None:
+    if not os.path.exists(symlink_path) or os.path.islink(symlink_path):
+        return
+    mtime = time.localtime(os.path.getmtime(symlink_path))
+    stamp = time.strftime("%Y%m%d_%H%M%S", mtime)
+    os.makedirs(archive_dir, exist_ok=True)
+    archived_path = _unique_log_path(archive_dir, stamp, suffix="_legacy")
+    os.replace(symlink_path, archived_path)
+
+
+def ensure_run_log_file(
+    log_dir: str = "logs",
+    archive_dir: str = "logs/archive",
+    symlink_name: str = "logs/train.log",
+) -> str:
+    log_dir_abs = os.path.abspath(log_dir)
+    archive_dir_abs = os.path.abspath(archive_dir)
+
+    os.makedirs(log_dir_abs, exist_ok=True)
+    os.makedirs(archive_dir_abs, exist_ok=True)
+    if symlink_name:
+        symlink_path = os.path.abspath(symlink_name)
+        _archive_existing_log(symlink_path, archive_dir_abs)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_file = _unique_log_path(archive_dir_abs, timestamp)
+    os.environ["RAY_TRAIN_LOG_FILE"] = log_file
+
+    if symlink_name:
+        if os.path.lexists(symlink_path):
+            os.unlink(symlink_path)
+        os.makedirs(os.path.dirname(symlink_path), exist_ok=True)
+        rel_target = os.path.relpath(log_file, start=os.path.dirname(symlink_path))
+        os.symlink(rel_target, symlink_path)
+
+    return log_file
 
 
 def get_physical_gpu_id() -> str:
@@ -36,8 +85,7 @@ def prepare_runtime_environment() -> dict[str, str]:
 
     # Set log file path for Ray actors to use
     if "RAY_TRAIN_LOG_FILE" not in os.environ:
-        log_file = os.path.abspath("logs/train.log")
-        os.environ["RAY_TRAIN_LOG_FILE"] = log_file
+        log_file = ensure_run_log_file()
         env_vars["RAY_TRAIN_LOG_FILE"] = log_file
     else:
         env_vars["RAY_TRAIN_LOG_FILE"] = os.environ["RAY_TRAIN_LOG_FILE"]

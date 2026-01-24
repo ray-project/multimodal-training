@@ -14,9 +14,11 @@ import torch
 from omegaconf import DictConfig
 from ray.experimental.collective import create_collective_group
 
+from .ray.utils import ensure_run_log_file
+
 # Set log file path BEFORE importing logger module
 if "RAY_TRAIN_LOG_FILE" not in os.environ:
-    os.environ["RAY_TRAIN_LOG_FILE"] = os.path.abspath("logs/train.log")
+    ensure_run_log_file()
 
 from .checkpoint import find_latest_checkpoint, load_epoch_checkpoint, save_epoch_checkpoint
 from .ray.actor_group import ActorGroup
