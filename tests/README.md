@@ -77,6 +77,32 @@ torchrun --nproc_per_node=4 -m pytest tests/deepspeed/test_vision_sp_dp.py -v
 
 Verifies hybrid parallelism combining DeepSpeed Sequence Parallel with Data Parallel for the vision model (sp_size=2, dp_size=2). Tests that different DP ranks process different data, SP ranks within each DP group synchronize correctly, and parameters are synchronized across DP ranks after optimizer steps.
 
+### Megatron single-trainer (text-only or vision-only)
+
+```bash
+MEGATRON_SINGLE_MODEL=Qwen/Qwen1.5-MoE-A2.7B-Chat \
+MEGATRON_SINGLE_MODEL_TYPE=qwen2_moe \
+MEGATRON_SINGLE_TRAINER=text \
+MEGATRON_SINGLE_LOAD_WEIGHTS=0 \
+pytest tests/megatron/test_single_trainer.py -m gpu
+```
+
+To run a TP/EP matrix with a single command:
+
+```bash
+MEGATRON_SINGLE_MODEL=Qwen/Qwen1.5-MoE-A2.7B-Chat \
+MEGATRON_SINGLE_MODEL_TYPE=qwen2_moe \
+MEGATRON_SINGLE_MATRIX=1 \
+MEGATRON_SINGLE_LOAD_WEIGHTS=0 \
+pytest tests/megatron/test_single_trainer.py -m gpu
+```
+
+Override the per-run topology with:
+
+- `MEGATRON_SINGLE_TP_SIZE`
+- `MEGATRON_SINGLE_EP_SIZE`
+- `MEGATRON_SINGLE_NUM_ACTORS` (defaults to TP * EP)
+
 ## Dataset alignment test
 
 `tests/test_dataset_modalities.py::test_real_dataset_alignment` automatically skips if the COCO validation set defined in `DEFAULT_DATA_REGISTRY` is not present. To exercise it fully, download the dataset referenced in the registry before running `pytest -m cpu_only`.

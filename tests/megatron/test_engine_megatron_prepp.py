@@ -15,7 +15,7 @@ from python.ray.megatron_trainer import (  # noqa: E402
 
 pytestmark = [pytest.mark.gpu]
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 MEGATRON_ROOT = PROJECT_ROOT / "Megatron-LM"
 MS_SWIFT_ROOT = PROJECT_ROOT / "ms-swift"
 
@@ -25,7 +25,13 @@ sys.path.insert(0, str(MS_SWIFT_ROOT))
 
 
 def _build_component_config(model_path: str):
-    return {
+    import os
+
+    expert_model_parallel_size = int(os.environ.get("MEGATRON_TEST_EP_SIZE", "1"))
+    num_experts_env = os.environ.get("MEGATRON_TEST_NUM_EXPERTS")
+    load_weights_env = os.environ.get("MEGATRON_TEST_LOAD_WEIGHTS", "true").lower()
+    load_weights = load_weights_env not in {"0", "false", "no"}
+    config = {
         "model_name": model_path,
         "model_type": "qwen2_5_vl",
         "engine": "megatron",
@@ -34,7 +40,8 @@ def _build_component_config(model_path: str):
             "sequence_parallel_size": 1,
             "pipeline_model_parallel_size": 1,
             "attention_backend": "unfused",
-            "load_weights": True,
+            "expert_model_parallel_size": expert_model_parallel_size,
+            "load_weights": load_weights,
         },
         "parallelism": "tensor",
         "dtype": "bfloat16",
@@ -46,6 +53,9 @@ def _build_component_config(model_path: str):
         "parallel_size": 1,
         "text_seq_len": 4,
     }
+    if num_experts_env is not None:
+        config["engine_config"]["num_experts"] = int(num_experts_env)
+    return config
 
 
 def test_megatron_engine_prepp():

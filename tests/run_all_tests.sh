@@ -213,12 +213,31 @@ else
         echo "Found $GPU_COUNT GPU(s). Running GPU tests..."
         echo ""
 
+        MEGATRON_SINGLE_TEST="tests/megatron/test_single_trainer.py"
+        MEGATRON_MODEL="${MEGATRON_SINGLE_MODEL:-Qwen/Qwen1.5-MoE-A2.7B-Chat}"
+        MEGATRON_MODEL_TYPE="${MEGATRON_SINGLE_MODEL_TYPE:-qwen2_moe}"
+        MEGATRON_MATRIX="${MEGATRON_SINGLE_MATRIX:-1}"
+        MEGATRON_LOAD_WEIGHTS="${MEGATRON_SINGLE_LOAD_WEIGHTS:-0}"
+
+        if [ -f "$MEGATRON_SINGLE_TEST" ]; then
+            if [ "$GPU_COUNT" -ge 4 ]; then
+                run_test "GPU tests ($MEGATRON_SINGLE_TEST matrix)" \
+                    "MEGATRON_SINGLE_MODEL=$MEGATRON_MODEL MEGATRON_SINGLE_MODEL_TYPE=$MEGATRON_MODEL_TYPE MEGATRON_SINGLE_MATRIX=$MEGATRON_MATRIX MEGATRON_SINGLE_LOAD_WEIGHTS=$MEGATRON_LOAD_WEIGHTS pytest $MEGATRON_SINGLE_TEST -m gpu"
+            else
+                run_test "GPU tests ($MEGATRON_SINGLE_TEST tp1/ep1)" \
+                    "MEGATRON_SINGLE_MODEL=$MEGATRON_MODEL MEGATRON_SINGLE_MODEL_TYPE=$MEGATRON_MODEL_TYPE MEGATRON_SINGLE_TP_SIZE=1 MEGATRON_SINGLE_EP_SIZE=1 MEGATRON_SINGLE_LOAD_WEIGHTS=$MEGATRON_LOAD_WEIGHTS pytest $MEGATRON_SINGLE_TEST -m gpu"
+            fi
+        fi
+
         GPU_TEST_FILES=$(collect_gpu_test_files)
         if [ -z "$GPU_TEST_FILES" ]; then
             echo -e "${YELLOW}No tests collected with -m gpu. Skipping GPU tests.${NC}"
             echo ""
         else
             for test_file in $GPU_TEST_FILES; do
+                if [ "$test_file" = "$MEGATRON_SINGLE_TEST" ]; then
+                    continue
+                fi
                 REQUIRED_GPUS=$(required_gpus_for_file "$test_file")
                 if [ "$GPU_COUNT" -lt "$REQUIRED_GPUS" ]; then
                     echo -e "${YELLOW}Skipping $test_file (requires $REQUIRED_GPUS+ GPUs, found $GPU_COUNT)${NC}"

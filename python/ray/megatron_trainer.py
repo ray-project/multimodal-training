@@ -58,6 +58,8 @@ class MegatronBaseTrainer(Trainer):
         tp_size = int(engine_config.get("tensor_parallel_size", 1))
         sp_size = int(engine_config.get("sequence_parallel_size", 1))
         pp_size = int(engine_config.get("pipeline_model_parallel_size", 1))
+        ep_size = int(engine_config.get("expert_model_parallel_size", 1))
+        num_experts = engine_config.get("num_experts", None)
 
         torch_dtype = self._get_torch_dtype(self.config["dtype"])
         convert_kwargs = {
@@ -72,7 +74,10 @@ class MegatronBaseTrainer(Trainer):
             "pipeline_model_parallel_size": pp_size,
             "sequence_parallel": sp_size > 1,
             "context_parallel_size": sp_size,
+            "expert_model_parallel_size": ep_size,
         }
+        if num_experts is not None:
+            convert_kwargs["num_experts"] = int(num_experts)
 
         megatron_args = MegatronArguments(
             model=model_name,
